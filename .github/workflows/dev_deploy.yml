@@ -1,0 +1,119 @@
+name: Dev Deploy
+
+on:
+  push:
+    branches:
+      - dev
+
+# 배포는 한 번에 하나만. PR을 연달아 머지하면 런이 동시에 떠서 같은 EC2를 함께 만지는데,
+# 한쪽의 `compose down`과 다른 쪽의 `compose up`이 겹치면 컨테이너 이름 충돌로 배포가 깨진다
+# (2026-08-08 실제 발생: "container name /semojum-redis-1 is already in use").
+# cancel-in-progress: false — 앞 배포를 끝까지 마치고 다음을 실행한다. 취소하면 컨테이너를
+# 내린 상태에서 중단돼 서비스가 죽을 수 있다.
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false
+
+# AWS 인증은 GitHub OIDC 임시 자격증명(2026-10-27) — 저장된 액세스 키가 없다.
+# 역할 semojum-github-deploy 는 이 레포의 dev 브랜치에서 돈 워크플로만 맡을 수 있다(신뢰 정책 sub 조건)
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-2
+  DEPLOY_ROLE_ARN: ${{ secrets.DEPLOY_ROLE_ARN }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v3
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      # 의존성·빌드 캐시 — dev(기본 브랜치) 런이 캐시를 쓰고 PR 런(pr_test.yml)이 읽는다
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # 테스트가 하나라도 실패하면 여기서 멈춰 배포가 나가지 않는다.
+      # Testcontainers(PostgreSQL·Redis)를 쓰므로 러너의 Docker가 필요하다(ubuntu-latest에 기본 포함).
+      - name: Run tests
+        run: ./gradlew test
+
+      - name: Upload test report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report
+          path: build/reports/tests/test
+          retention-days: 7
+
+      - name: Build JAR
+        run: ./gradlew bootJar -x test
+
+      # OIDC 로 배포 역할을 맡는다 — ECR 푸시와 22번 임시 개방 권한만 있다
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # 이미지는 비공개 ECR 에 커밋 해시 태그로 올린다. 저장소가 태그 덮어쓰기 금지라
+      # 한 태그 = 한 커밋이 보장되고, 롤백은 이전 해시로 다시 배포하면 된다
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/semojum-backend:${{ github.sha }}
+
+      # EC2의 22번 포트를 상시 개방하지 않기 위해, 배포 동안만 러너 IP를 허용한다.
+
+      - name: Open SSH for runner IP
+        id: open-ssh
+        run: |
+          RUNNER_IP=$(curl -s https://checkip.amazonaws.com)
+          echo "runner_ip=$RUNNER_IP" >> "$GITHUB_OUTPUT"
+          aws ec2 authorize-security-group-ingress \
+            --group-id ${{ secrets.EC2_SECURITY_GROUP_ID }} \
+            --protocol tcp --port 22 --cidr "$RUNNER_IP/32"
+
+      - name: Copy deploy files to VM
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          source: "docker-compose.yml,envoy.yaml,scripts/deploy.sh"
+          target: "/home/ubuntu/semojum/"
+
+      # 블루그린 무중단 배포: 새 이미지를 비활성 색으로 띄우고 헬스 통과 후 구 색을 내린다.
+      # 새 버전이 안 뜨면 deploy.sh가 실패(exit 1)하고 구버전이 계속 서비스한다(배포 게이트).
+      - name: Deploy via SSH (blue-green)
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          command_timeout: 10m
+          # 방금 올린 이미지를 정확히 지정해 띄운다(이미지 주소는 비밀이 아니다)
+          script: BACKEND_IMAGE=${{ steps.ecr.outputs.registry }}/semojum-backend:${{ github.sha }} bash /home/ubuntu/semojum/scripts/deploy.sh
+
+      # 배포 성공·실패와 무관하게 반드시 회수 (규칙이 남아 포트가 열린 채 방치되지 않도록)
+      - name: Close SSH for runner IP
+        if: always() && steps.open-ssh.outputs.runner_ip != ''
+        run: |
+          aws ec2 revoke-security-group-ingress \
+            --group-id ${{ secrets.EC2_SECURITY_GROUP_ID }} \
+            --protocol tcp --port 22 --cidr "${{ steps.open-ssh.outputs.runner_ip }}/32"

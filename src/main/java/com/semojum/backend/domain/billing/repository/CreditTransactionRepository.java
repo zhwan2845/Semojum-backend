@@ -1,0 +1,84 @@
+package com.semojum.backend.domain.billing.repository;
+
+import com.semojum.backend.domain.billing.entity.CreditTransaction;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.UUID;
+import java.time.LocalDate;
+
+public interface CreditTransactionRepository extends JpaRepository<CreditTransaction, UUID> {
+
+    List<CreditTransaction> findByJobIdOrderByPageNo(String jobId);
+
+    // 워커 재시도 재진입 시 이중 차감 방지 (DB 유니크 인덱스가 최종 방어선)
+    boolean existsByJobIdAndPageNo(String jobId, int pageNo);
+
+    // 작업 총 소모 크레딧 (기록 없으면 0)
+    @Query("SELECT COALESCE(SUM(t.amount), 0) FROM CreditTransaction t WHERE t.jobId = :jobId")
+    long sumAmountByJobId(@Param("jobId") String jobId);
+
+    // 기관 누적 사용량 (잔여 = organizations.credit_allocated − 이 값)
+    @Query("SELECT COALESCE(SUM(t.amount), 0) FROM CreditTransaction t WHERE t.organizationId = :orgId")
+    long sumByOrganization(@Param("orgId") UUID orgId);
+
+    // 계약분 차감만 (잔여 게이지·수익성 매출의 축 — 쿠폰 차감은 계약 잔여를 안 깎음)
+    @Query("SELECT COALESCE(SUM(t.amount), 0) FROM CreditTransaction t " +
+            "WHERE t.organizationId = :orgId AND t.source = 'CONTRACT'")
+    long sumContractByOrganization(@Param("orgId") UUID orgId);
+
+    // 쿠폰 사용량 (잔량 = coupon.credit_amount − 이 값)
+    // 잔여 크레딧 계산용 — 오늘 유효한 쿠폰에서 이미 쓴 양
+    @Query("SELECT COALESCE(SUM(t.amount), 0) FROM CreditTransaction t, Coupon c " +
+            "WHERE t.couponId = c.id AND c.organizationId = :orgId " +
+            "AND c.startsOn <= :today AND c.endsOn >= :today")
+    long sumUsedOnActiveCoupons(@Param("orgId") UUID orgId, @Param("today") LocalDate today);
+
+    @Query("SELECT COALESCE(SUM(t.amount), 0) FROM CreditTransaction t WHERE t.couponId = :couponId")
+    long sumByCoupon(@Param("couponId") UUID couponId);
+
+    // 계정의 기간 차감 내역 — 일별 · 입력 종류별 사용량. [created_at, amount, job_id]
+    @Query("SELECT t.createdAt, t.amount, t.jobId FROM CreditTransaction t " +
+            "WHERE t.userId = :userId AND t.createdAt >= :from AND t.createdAt < :to")
+    List<Object[]> findUsageRowsByUserBetween(@Param("userId") UUID userId,
+                                              @Param("from") Instant from,
+                                              @Param("to") Instant to);
+
+    // 계정의 기간 사용량 (사용량 화면 이번 달/지난달)
+    @Query("SELECT COALESCE(SUM(t.amount), 0) FROM CreditTransaction t " +
+            "WHERE t.userId = :userId AND t.createdAt >= :from AND t.createdAt < :to")
+    long sumByUserBetween(@Param("userId") UUID userId,
+                          @Param("from") Instant from, @Param("to") Instant to);
+
+    // 기관별 기간 "유료(계약분)" 차감 합 (운영자 수익성 — 환산 매출의 축. 쿠폰 차감은 매출 0)
+    @Query("SELECT t.organizationId, COALESCE(SUM(t.amount), 0) FROM CreditTransaction t " +
+            "WHERE t.organizationId IS NOT NULL AND t.source = 'CONTRACT' " +
+            "AND t.createdAt >= :from AND t.createdAt < :to GROUP BY t.organizationId")
+    List<Object[]> sumPerOrganizationBetween(@Param("from") Instant from, @Param("to") Instant to);
+
+    // 전 기관 계정별 기간 사용량 (운영자 기관·계정 통합 표) — [organizationId, userId, sum]
+    @Query("SELECT t.organizationId, t.userId, COALESCE(SUM(t.amount), 0) FROM CreditTransaction t " +
+            "WHERE t.createdAt >= :from AND t.createdAt < :to GROUP BY t.organizationId, t.userId")
+    List<Object[]> sumPerOrgUserBetween(@Param("from") Instant from, @Param("to") Instant to);
+
+    // 기관 소속 계정별 누적 사용량 (기관 관리자 소속 계정 표의 "사용" 열 — 계약 시작일 이후)
+    // 시작일 미설정 기관은 Instant.EPOCH를 넘겨 전체 누적 — ":x IS NULL OR" 패턴은 PG 타입 추론 리스크로 회피
+    @Query("SELECT t.userId, COALESCE(SUM(t.amount), 0) FROM CreditTransaction t " +
+            "WHERE t.organizationId = :orgId AND t.createdAt >= :from GROUP BY t.userId")
+    List<Object[]> sumPerUserByOrganizationSince(@Param("orgId") UUID orgId, @Param("from") Instant from);
+
+    // 기관 월별 사용 추이 (기관 관리 차트) — KST 월 기준 [월("YYYY-MM"), sum]
+    @Query(value = "SELECT to_char(created_at AT TIME ZONE 'Asia/Seoul', 'YYYY-MM') AS month, " +
+            "COALESCE(SUM(amount), 0) FROM credit_transactions " +
+            "WHERE organization_id = :orgId AND created_at >= :from GROUP BY month ORDER BY month",
+            nativeQuery = true)
+    List<Object[]> monthlySumsByOrganization(@Param("orgId") UUID orgId, @Param("from") Instant from);
+
+    // 작업별 소모 크레딧 일괄 조회 (기관 관리자 계정 상세 · 사용량의 작업 목록 — N+1 방지) — [jobId, sum]
+    @Query("SELECT t.jobId, COALESCE(SUM(t.amount), 0) FROM CreditTransaction t " +
+            "WHERE t.jobId IN :jobIds GROUP BY t.jobId")
+    List<Object[]> sumPerJob(@Param("jobIds") List<String> jobIds);
+}

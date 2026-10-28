@@ -1,0 +1,322 @@
+package com.semojum.backend.domain.job.worker;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.semojum.backend.domain.job.scheduler.JobDispatcher;
+import com.semojum.backend.domain.job.service.PageImageService;
+import com.semojum.backend.domain.job.service.JobCancelService;
+import com.semojum.backend.domain.result.service.ResultService;
+import com.semojum.backend.global.s3.S3Service;
+import com.semojum.backend.global.grpc.AiServerPool;
+import com.semojum.backend.global.grpc.BrailleGrpcClient;
+import com.semojum.backend.grpc.BrailleRequest;
+import com.semojum.backend.grpc.BrailleResponse;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.stereotype.Component;
+
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import com.google.protobuf.ByteString;
+import com.semojum.backend.domain.job.entity.Page;
+import com.semojum.backend.domain.job.scheduler.CreditGate;
+import org.slf4j.MDC;
+import com.semojum.backend.domain.job.service.JobRedisKeys;
+
+/**
+ * 쪽 처리 워커 — 스케줄러에서 쪽을 하나씩 꺼내 AI(gRPC)에 보내고 결과를 저장한다. 워커 수 = AI 서버 총 슬롯 수.
+ *
+ * <p>오류는 큐 머리에 다시 넣어 최대 3회 재시도, 넘으면 BLOCKED — ⚠️ Redis 상태는 DB 반영과 무관하게 항상 갱신한다(SSE 종료 감지)
+ *
+ * <p>⚠️ 배포 때 종료는 5초만 기다린다 — 처리 중이던 쪽은 재시도 큐에 다시 넣지 않고 유실된다
+ */
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class PageWorker {
+
+    private final RedisTemplate<String, String> redisTemplate;
+    private final S3Service s3Service;
+    private final BrailleGrpcClient grpcClient;
+    private final ObjectMapper objectMapper;
+    private final ResultService resultService;
+    private final AiServerPool aiServerPool;
+    private final JobDispatcher jobDispatcher;
+    private final JobCancelService jobCancelService;
+    private final PageImageService pageImageService;
+    private final CreditGate creditGate;
+
+    // 워커 실행 여부 플래그 (volatile: 멀티스레드 환경에서 즉시 반영)
+    private volatile boolean running = true;
+    private ExecutorService executor;
+
+    // 워커 수 = AI 서버 총 슬롯 수 — 각 워커가 슬롯 하나를 점유해 블로킹 gRPC를 보내는 구조라
+    // 워커가 슬롯보다 많으면 슬롯 대기로 큐가 헛돌고, 적으면 슬롯이 논다.
+    @PostConstruct
+    public void startWorkers() {
+        int workerCount = aiServerPool.getTotalSlots();
+        executor = Executors.newFixedThreadPool(workerCount);
+        for (int i = 0; i < workerCount; i++) {
+            final int workerId = i + 1;
+            executor.submit(() -> runWorker(workerId));
+        }
+        log.info("PageWorker {}개 시작 (AI 서버 총 슬롯 수)", workerCount);
+    }
+
+    @PreDestroy
+    public void stopWorkers() {
+        log.info("PageWorker 종료 중...");
+        running = false;
+        executor.shutdown();
+        try {
+            if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            executor.shutdownNow();
+        }
+        log.info("PageWorker 종료 완료");
+    }
+
+    /** 태스크에서 이 쪽의 원본 조각(txt · pdf · 이미지) S3 경로를 꺼낸다. 없으면 null — 호출부의 재시도 경로가 받는다 */
+    static String sourcePathOf(Map<String, Object> taskMap) {
+        return (String) taskMap.get("sourcePath");
+    }
+
+    /**
+     * 작업 mode → AI에 보낼 mode (proto: {@code "a"} PDF·이미지 | {@code "b"} 글).
+     *
+     * <p><b>DB의 {@code jobs.mode}는 바꾸지 않고 보낼 때만 옮긴다.</b> BE는 PDF·HWP·이미지 작업을
+     * {@code c}(원본 | 텍스트 | 점자 3패널)로 저장하는데, AI 쪽에서 {@code c}가 없어졌고 그 자리를
+     * {@code a}가 맡는다. DB를 바꾸면 기존 작업 전부와 FE의 모드 분기가 흔들린다.
+     * 예전 {@code a} 작업도 PDF 입력이라 그대로 {@code a}다.
+     */
+    static String aiModeOf(String jobMode) {
+        return "b".equals(jobMode) ? "b" : "a";
+    }
+
+    /** 태스크 JSON의 숫자 칸 — 없거나(구 태스크) 숫자가 아니면 0 */
+    static int intOf(Object value) {
+        return value instanceof Number n ? n.intValue() : 0;
+    }
+
+    /**
+     * 이 쪽의 원본이 이미지인지 — 경로 확장자로 가른다.
+     *
+     * <p>태스크에 따로 표시를 넣지 않은 이유: 큐는 Redis라 배포로 비워지지 않아서 필드를 늘리면
+     * 그 순간 큐에 남아 있던 구 형식 태스크에는 그 값이 없다. 경로는 어느 형식에나 이미 있다.
+     */
+    static boolean isImageSource(String sourcePath) {
+        if (sourcePath == null) return false;
+        String lower = sourcePath.toLowerCase();
+        return lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png");
+    }
+
+    /**
+     * AI에 알려줄 이미지 형식 — proto {@code image_mime_type}에 싣는다. 확장자로만 정한다(업로드 때 검증했다).
+     *
+     * <p>S3에 올릴 때 쓴 Content-Type과 같은 값이다({@code JobService.imageMime}). 여기서 다시
+     * 만드는 건 입력이 달라서다 — 저쪽은 업로드 파일의 확장자, 이쪽은 S3 키 경로를 본다.
+     *
+     * <p>⚠️ {@code .jpg}의 MIME은 {@code image/jpeg}다 — {@code image/jpg}는 없는 타입이다.
+     */
+    static String imageMimeTypeOf(String sourcePath) {
+        return sourcePath != null && sourcePath.toLowerCase().endsWith(".png") ? "image/png" : "image/jpeg";
+    }
+
+    private void runWorker(int workerId) {
+        log.info("Worker-{} 시작", workerId);
+        while (running) {
+            String task = null;
+            try {
+                // 공정 스케줄러에서 다음 태스크 선택 (유저→작업 라운드로빈 + FG/BG 4:1)
+                task = jobDispatcher.poll();
+                if (task == null) {
+                    Thread.sleep(100);
+                    continue;
+                }
+
+                Map<String, Object> taskMap = objectMapper.readValue(task, Map.class);
+                String jobId = (String) taskMap.get("jobId");
+                int pageNo = (int) taskMap.get("pageNo");
+                String sourcePath = sourcePathOf(taskMap);
+                String mode = (String) taskMap.get("mode");
+                int totalPages = (int) taskMap.get("totalPages");
+
+                // 이 태스크가 남기는 모든 로그(S3·gRPC·ResultService 포함)를 작업 키로 묶는다
+                // — "grep jobId" 하나로 페이지 처리 전 과정 추적. 루프 밖 finally가 해제
+                MDC.put("ctx", jobId + "|p" + pageNo);
+
+                // 취소된 작업의 태스크는 처리하지 않고 폐기 — 플래그 이전에 이 검사를 통과한 태스크만
+                // "AI에 들어간 페이지"로 취급되어 마무리된다 (JobCancelService 참고)
+                if (jobCancelService.isCanceled(jobId)) {
+                    jobCancelService.cancelPage(jobId, pageNo);
+                    log.info("Worker-{} 취소된 작업 태스크 폐기: jobId={}, pageNo={}", workerId, jobId, pageNo);
+                    continue;
+                }
+
+                // 기관 잔여 크레딧이 0 이하면 AI에 보내지 않고 「크레딧 부족」으로 막는다.
+                // 직전 쪽이 잔여보다 많이 써서 마이너스가 됐어도 그 쪽은 이미 처리됐다(거기까지는 해 준다)
+                if (creditGate.exhausted(jobId)) {
+                    blockForCredit(workerId, jobId, pageNo);
+                    continue;
+                }
+
+                log.info("Worker-{} 작업 시작: jobId={}, pageNo={}", workerId, jobId, pageNo);
+
+                // Redis 상태 → RUNNING
+                redisTemplate.opsForHash().put(JobRedisKeys.pages(jobId), JobRedisKeys.pageField(pageNo), "RUNNING");
+
+                byte[] fileData = s3Service.downloadFile(sourcePath);
+
+                // 원본 미리보기 이미지 렌더 (a·c만 — b는 원본이 텍스트).
+                // AI 요청 '전'에 만들어 둔다: 결과가 나오는 순간(page_done) 사용자가 그 쪽을 열어도
+                // 이미지가 이미 준비돼 있어 PDF 폴백으로 떨어지지 않는다. 실패는 서비스가 삼킨다.
+                // 이미지 업로드는 원본이 이미 미리보기다 — 생성 시점에 imagePath를 채워 뒀다
+                if (!mode.equals("b") && !isImageSource(sourcePath)) {
+                    pageImageService.generateAndStore(jobId, pageNo, fileData);
+                }
+
+                // gRPC 요청 빌드
+                // 고급 교열 여부는 업로드 옵션에서 정해져 태스크에 실려 온다 (구 태스크엔 없어 기본 false)
+                boolean advancedAi = Boolean.TRUE.equals(taskMap.get("advancedAi"));
+
+                BrailleRequest.Builder requestBuilder = BrailleRequest.newBuilder()
+                        .setJobId(jobId)
+                        .setPageNo(pageNo)
+                        .setTotalPages(totalPages)
+                        .setMode(aiModeOf(mode))
+                        .setAdvancedAi(advancedAi)
+                        // 점역 옵션(proto 10·11·12) — 업로드 때 정해져 태스크에 실려 온다.
+                        // 구 태스크엔 없어 0·false = AI 서버 기본값(약자·짧은 선택지 합치기)
+                        .setKoreanGrade(intOf(taskMap.get("koreanGrade")))
+                        .setEnglishGrade(intOf(taskMap.get("englishGrade")))
+                        .setSplitChoices(Boolean.TRUE.equals(taskMap.get("splitChoices")));
+
+                if (mode.equals("b")) {
+                    // mode b: 글 원문으로 전송 (proto text_data)
+                    String sourceText = new String(fileData);
+                    requestBuilder.setTextData(sourceText);
+                } else if (isImageSource(sourcePath)) {
+                    // 이미지 업로드: PDF로 바꾸지 않고 원본 바이트를 그대로 보낸다
+                    requestBuilder.setImageData(ByteString.copyFrom(fileData));
+                    requestBuilder.setImageMimeType(imageMimeTypeOf(sourcePath));
+                } else {
+                    // PDF 1쪽으로 전송 (작업 mode a·c — AI에는 둘 다 "a"로 간다)
+                    requestBuilder.setPdfData(ByteString.copyFrom(fileData));
+                }
+
+                // AI 서버에 gRPC 요청
+                BrailleResponse response = grpcClient.processPage(requestBuilder.build());
+
+                resultService.save(response);
+
+                // Redis 상태 → COMPLETED or NEEDS_REVIEW or BLOCKED
+                redisTemplate.opsForHash().put(JobRedisKeys.pages(jobId), JobRedisKeys.pageField(pageNo), response.getStatus());
+
+                log.info("Worker-{} 작업 완료: jobId={}, pageNo={}, status={}", workerId, jobId, pageNo, response.getStatus());
+
+                // 취소된 작업의 마지막 인플라이트였다면 여기서 취소가 확정된다
+                if (jobCancelService.isCanceled(jobId)) {
+                    jobCancelService.tryFinalize(jobId);
+                }
+
+            } catch (Exception e) {
+                if (running) {
+                    if (task != null) {
+                        try {
+                            Map<String, Object> taskMap = new HashMap<>(objectMapper.readValue(task, Map.class));
+                            String jobId = (String) taskMap.get("jobId");
+                            String taskUserId = (String) taskMap.get("userId");
+                            int pageNo = (int) taskMap.get("pageNo");
+                            int retryCount = taskMap.get("retryCount") != null ? (int) taskMap.get("retryCount") : 0;
+                            int backpressureCount = taskMap.get("backpressureCount") != null ? (int) taskMap.get("backpressureCount") : 0;
+
+                            // 취소된 작업은 재시도·백프레셔 재등록 대신 폐기 (스케줄러에 다시 들어가지 않게)
+                            if (jobCancelService.isCanceled(jobId)) {
+                                jobCancelService.cancelPage(jobId, pageNo);
+                                log.info("Worker-{} 취소된 작업 재시도 폐기: jobId={}, pageNo={}", workerId, jobId, pageNo);
+                                continue;
+                            }
+
+                            // AI 서버 백프레셔(RESOURCE_EXHAUSTED): 응답 직후 내부 슬롯 해제가 늦어
+                            // 잠깐 튕기는 정상 신호 — 실패로 세지 않고 잠시 후 재등록 (실측: 해제 지연 ~수십 ms).
+                            // 무한 루프 방지로 10회 초과 시엔 일반 재시도 경로로 넘긴다.
+                            if (isBackpressure(e) && backpressureCount < 10) {
+                                taskMap.put("backpressureCount", backpressureCount + 1);
+                                redisTemplate.opsForHash().put(JobRedisKeys.pages(jobId), JobRedisKeys.pageField(pageNo), "PENDING");
+                                Thread.sleep(300); // 해제 지연 창을 넘긴 뒤 재등록 (즉시 재등록하면 다른 워커가 바로 또 튕김)
+                                jobDispatcher.requeue(taskUserId, jobId, objectMapper.writeValueAsString(taskMap));
+                                log.warn("Worker-{} AI 백프레셔, 잠시 후 재등록 ({}/10): jobId={}, pageNo={}", workerId, backpressureCount + 1, jobId, pageNo);
+                                continue;
+                            }
+
+                            if (retryCount < 3) {
+                                // 재시도 횟수를 올려 자기 작업 큐 머리에 다시 넣는다(leftPush — 쪽 순서 유지)
+                                taskMap.put("retryCount", retryCount + 1);
+                                redisTemplate.opsForHash().put(JobRedisKeys.pages(jobId), JobRedisKeys.pageField(pageNo), "PENDING");
+                                jobDispatcher.requeue(taskUserId, jobId, objectMapper.writeValueAsString(taskMap));
+                                log.error("Worker-{} 오류 발생, 재시도 큐에 등록 ({}/3): {}", workerId, retryCount + 1, e.getMessage());
+                            } else {
+                                // 최대 재시도 초과 → DB Page=BLOCKED + Job 종료 판정.
+                                // DB 반영 실패와 무관하게 Redis는 항상 BLOCKED로 갱신(SSE가 종료를 감지하도록 보장).
+                                try {
+                                    resultService.markPageBlocked(jobId, pageNo);
+                                } catch (Exception blockEx) {
+                                    log.error("Worker-{} markPageBlocked 실패(Redis는 BLOCKED 유지): jobId={}, pageNo={}, error={}", workerId, jobId, pageNo, blockEx.getMessage(), blockEx);
+                                }
+                                redisTemplate.opsForHash().put(JobRedisKeys.pages(jobId), JobRedisKeys.pageField(pageNo), "BLOCKED");
+                                log.error("Worker-{} 최대 재시도 초과, BLOCKED 처리: jobId={}, pageNo={}, error={}", workerId, jobId, pageNo, e.getMessage());
+                                // 취소 대기 중이던 작업이라면 이 페이지가 마지막 걸림돌이었을 수 있다
+                                if (jobCancelService.isCanceled(jobId)) {
+                                    jobCancelService.tryFinalize(jobId);
+                                }
+                            }
+                        } catch (Exception ex) {
+                            // pop된 task가 무로그로 증발하지 않도록 가시화 (파싱 실패/leftPush 실패 등 포함).
+                            // task JSON에 jobId/pageNo/retryCount가 들어 있다.
+                            log.error("Worker-{} 예외 처리 중 추가 오류, task 처리 실패: task={}, error={}", workerId, task, ex.getMessage(), ex);
+                        }
+                    }
+                    try {
+                        Thread.sleep(2000);
+                    } catch (InterruptedException ignored) {}
+                }
+            } finally {
+                // AI에 들어가 있던 쪽에서 뺀다 — 결과 저장(차감)이 끝난 뒤라 다음 쪽은 새 잔액을 본다
+                creditGate.release(task);
+                // 다음 태스크의 로그에 이전 작업 키가 섞이지 않도록 해제
+                MDC.remove("ctx");
+            }
+        }
+        log.info("Worker-{} 종료", workerId);
+    }
+
+    /**
+     * 크레딧 부족으로 쪽을 막는다. DB 반영이 실패해도 Redis는 BLOCKED로 둔다 — SSE가 종료를 알아채야 한다
+     * (최대 재시도 초과 경로와 같은 규칙).
+     */
+    private void blockForCredit(int workerId, String jobId, int pageNo) {
+        try {
+            resultService.markPageBlocked(jobId, pageNo, Page.BLOCKED_CREDIT_EXHAUSTED);
+        } catch (Exception e) {
+            log.error("Worker-{} 크레딧 부족 차단의 DB 반영 실패(Redis는 BLOCKED): jobId={}, pageNo={}, error={}",
+                    workerId, jobId, pageNo, e.getMessage(), e);
+        }
+        redisTemplate.opsForHash().put(JobRedisKeys.pages(jobId), JobRedisKeys.pageField(pageNo), "BLOCKED");
+        log.info("Worker-{} 크레딧 부족으로 차단: jobId={}, pageNo={}", workerId, jobId, pageNo);
+    }
+
+    // AI 서버가 동시 수용량 초과로 즉시 거부한 경우(진짜 실패가 아니라 잠깐 물러날 신호)
+    static boolean isBackpressure(Throwable e) {
+        return e instanceof StatusRuntimeException sre
+                && sre.getStatus().getCode() == Status.Code.RESOURCE_EXHAUSTED;
+    }
+}

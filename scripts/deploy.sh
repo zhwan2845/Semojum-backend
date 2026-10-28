@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# 블루그린 무중단 배포 — CI(dev_deploy.yml)가 EC2에서 실행한다.
+#
+# 흐름:
+#   1. 활성 색 감지 (blue/green 중 떠 있는 쪽)
+#   2. 새 이미지 pull → 비활성 색으로 기동
+#   3. 헬스 게이트: /api/health 200까지 대기(최대 120초) — 실패하면 새 색만 내리고 종료(구버전 무사)
+#   4. Envoy가 새 색을 healthy로 편입할 시간을 준 뒤 구 색 graceful 정지
+#   5. 구 이미지 정리
+#
+# 로그: 컨테이너가 재생성되면 Docker json-file 로그도 함께 사라지므로,
+#       사라지기 직전에 통째로 ~/semojum/logs 로 떠 둔다 (archive_logs)
+#
+# 이미지: CI가 BACKEND_IMAGE(비공개 ECR, 커밋 해시 태그)를 넘긴다(2026-10-27). EC2는 서버 역할(IAM)로
+#   ECR에 로그인한다 — amazon-ecr-credential-helper(~/.docker/config.json credHelpers), 저장된 토큰 없음
+#
+# 롤백: ① 방금 내려간 색 컨테이너를 그대로 다시 켠다 — 정지만 했으므로 옛 이미지로 뜬다
+#   docker start semojum-backend-blue-1 && docker compose --profile green stop backend-green
+#   (compose up 으로 켜면 .env 의 새 이미지로 다시 만들어지니 쓰지 말 것)
+# ② 또는 이전 이미지로 다시 배포: BACKEND_IMAGE=<이전 이미지> bash deploy.sh  (이력: ~/semojum/deployed-images.log)
+set -euo pipefail
+cd /home/ubuntu/semojum
+
+log() { echo "[deploy] $(date '+%H:%M:%S') $*"; }
+
+# 배포는 한 번에 하나만 — CI 의 concurrency 는 CI 끼리만 막는다. 수동 배포(Actions 한도 소진 때 등)와 CI 배포가
+# 겹치면 같은 컨테이너를 함께 만지다 이름 충돌로 깨진다(2026-08-08 CI 끼리 실제 발생). 서버에서 잠근다 — 앞 배포를 최대 15분 기다린다
+exec 9>/home/ubuntu/semojum/.deploy.lock
+if ! flock -w 900 9; then
+  log "FAIL: 다른 배포가 15분 넘게 진행 중 — 중단"
+  exit 1
+fi
+
+# ── 로그 아카이브 ───────────────────────────────────────────────
+# Docker json-file 로그(10MB×5)는 컨테이너에 딸려 있어, 새 이미지로 갈아끼우는 순간
+# 이전 로그가 통째로 사라진다. 배포가 잦을수록 장애 분석용 기록이 먼저 없어지므로
+# 컨테이너가 사라지기 직전·정지 직후에 파일로 떠 둔다.
+#
+# 파일명에 컨테이너 시작 시각을 쓴다 — 같은 컨테이너를 두 번 떠도 같은 이름이라
+# 덮어쓰기가 되고 중복이 쌓이지 않는다(부분 덤프 → 완전 덤프로 갱신).
+LOG_DIR=/home/ubuntu/semojum/logs
+LOG_KEEP=30   # 보관 개수. 초과분은 오래된 것부터 삭제 (한 파일 상한 50MB)
+
+archive_logs() {
+  local color="$1"
+  local cname="semojum-backend-${color}-1"
+
+  # 컨테이너가 아예 없으면(최초 기동 등) 뜰 로그도 없다
+  docker inspect "$cname" >/dev/null 2>&1 || return 0
+
+  mkdir -p "$LOG_DIR"
+  local started out
+  started=$(docker inspect --format '{{.State.StartedAt}}' "$cname" 2>/dev/null \
+            | cut -c1-19 | tr -d ':-' | tr 'T' '-')
+  out="${LOG_DIR}/backend-${color}-${started:-unknown}.log"
+
+  # 아카이브 실패가 배포를 막지는 않는다 — 로그는 부수 작업이다
+  if docker logs "$cname" > "$out" 2>&1; then
+    log "로그 보관: $(basename "$out") ($(du -h "$out" | cut -f1))"
+  else
+    log "WARN: ${color} 로그 보관 실패 — 배포는 계속"
+    rm -f "$out"
+  fi
+
+  # 오래된 것부터 정리 (파일이 없으면 조용히 넘어간다)
+  ls -1t "${LOG_DIR}"/backend-*.log 2>/dev/null | tail -n +$((LOG_KEEP + 1)) | xargs -r rm -f || true
+}
+
+# ── 1. 활성 색 감지 ─────────────────────────────────────────────
+if docker ps --format '{{.Names}}' | grep -q 'backend-blue'; then
+  ACTIVE=blue; IDLE=green; IDLE_PORT=8082
+elif docker ps --format '{{.Names}}' | grep -q 'backend-green'; then
+  ACTIVE=green; IDLE=blue; IDLE_PORT=8081
+else
+  ACTIVE=none; IDLE=blue; IDLE_PORT=8081   # 최초 전환(구 단일 backend 체제)
+fi
+log "활성=${ACTIVE} → 새 버전은 ${IDLE}로 기동"
+
+# ── 2. 새 이미지로 비활성 색 기동 ────────────────────────────────
+: "${BACKEND_IMAGE:?BACKEND_IMAGE 가 없다 — CI가 넘긴다. 수동 배포는 BACKEND_IMAGE=<ECR 이미지> bash deploy.sh}"
+docker pull "$BACKEND_IMAGE"
+# compose 는 .env 의 BACKEND_IMAGE 로 이미지를 고른다 — 남겨 두면 수동 compose 명령도 지금 배포된 이미지를 쓴다
+if grep -q '^BACKEND_IMAGE=' .env; then
+  sed -i "s|^BACKEND_IMAGE=.*|BACKEND_IMAGE=${BACKEND_IMAGE}|" .env
+else
+  echo "BACKEND_IMAGE=${BACKEND_IMAGE}" >> .env
+fi
+echo "$(date '+%F %T') ${BACKEND_IMAGE}" >> /home/ubuntu/semojum/deployed-images.log
+log "이미지: ${BACKEND_IMAGE}"
+# 점자 규정 데이터 갱신 — 평소엔 cron(30분)이 받고, 배포 때도 한 번 받는다. 실패해도 배포는 계속(지난 데이터로 뜬다)
+if [ -d braille-reference/.git ]; then
+  git -C braille-reference pull -q --ff-only && log "점자 규정 $(git -C braille-reference log -1 --format=%h) 반영" \
+    || log "WARN: 점자 규정 git pull 실패 — 지난 데이터로 계속"
+else
+  log "WARN: braille-reference clone 없음 — 규정 검색이 비어 있다"
+fi
+docker compose up -d redis
+# up -d 는 새 이미지로 컨테이너를 재생성한다 = 이 색의 기존 로그가 여기서 사라진다
+archive_logs "$IDLE"
+docker compose --profile "$IDLE" up -d "backend-$IDLE"
+
+# ── 3. 헬스 게이트 (최대 120초) ──────────────────────────────────
+HEALTHY=0
+for i in $(seq 1 60); do
+  if curl -sf "http://localhost:${IDLE_PORT}/api/health" >/dev/null 2>&1; then
+    HEALTHY=1; break
+  fi
+  sleep 2
+done
+if [ "$HEALTHY" != "1" ]; then
+  log "FAIL: ${IDLE} 헬스 실패 — 새 색 중지, ${ACTIVE}가 계속 서비스"
+  docker compose --profile "$IDLE" logs --tail 50 "backend-$IDLE" || true
+  docker compose --profile "$IDLE" stop "backend-$IDLE"
+  archive_logs "$IDLE"   # tail 50으로 안 잡히는 기동 실패 원인을 통째로 남긴다
+  exit 1
+fi
+log "OK: ${IDLE} 헬스 통과"
+
+# ── 4. 전환 ─────────────────────────────────────────────────────
+if [ "$ACTIVE" = "none" ]; then
+  # 최초 전환: 새 envoy.yaml 반영(정적 설정이라 재기동 필요) 후 구 단일 backend 컨테이너 제거.
+  # envoy 재기동 순간 약 1~2초 연결 단절 — 이 1회에 한해 감수 (이후 배포는 envoy 무재기동)
+  log "최초 전환 — envoy 재기동(새 설정 반영)"
+  docker compose up -d --force-recreate envoy
+  sleep 12   # envoy 기동 + 헬스체크 2회(3s×2)로 새 색 편입 대기
+  if docker ps -a --format '{{.Names}}' | grep -q '^semojum-backend-1$'; then
+    log "구 단일 backend 컨테이너 정지·제거"
+    docker stop semojum-backend-1 || true
+    docker rm semojum-backend-1 || true
+  fi
+else
+  # 평상시 전환: envoy는 손대지 않는다 — 헬스체크가 알아서 새 색 편입
+  # 액티브 헬스체크 interval 3s × healthy_threshold 2 → 최대 ~6s + 여유
+  sleep 10
+  docker compose --profile "$ACTIVE" stop "backend-$ACTIVE"
+  log "구 색(${ACTIVE}) graceful 정지 완료"
+  archive_logs "$ACTIVE"   # 이 버전이 서비스한 전 구간 로그가 여기서 완성된다
+fi
+
+# ── 5. 정리 ─────────────────────────────────────────────────────
+# 커밋마다 태그가 달라 옛 이미지가 쌓인다 — 컨테이너가 쓰지 않는 7일 지난 이미지만 지운다.
+# 정지한 구 색 컨테이너가 쓰는 이미지는 지우지 않으므로 롤백 ①은 그대로 된다
+docker image prune -af --filter "until=168h" >/dev/null
+log "배포 완료: ${IDLE} 활성"

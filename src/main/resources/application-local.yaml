@@ -1,0 +1,20 @@
+# 로컬 개발 — 프로파일을 지정하지 않으면 이 파일이 켜진다(spring.profiles.default). 테스트도 이 프로파일로 뜬다.
+# 비밀값(DB_PASSWORD · JWT_SECRET · GRPC_CERT_PATH)은 기본값 없이 환경변수로만 받는다.
+# 여기 기본값은 연결되지 않아도 기동은 되는 값이어야 한다 — 테스트 컨텍스트가 이 값으로 뜬다
+spring:
+  datasource:
+    # RDS 는 공개 접근이 꺼져 있어 BE 서버를 거치는 SSH 터널(로컬 5432)로 붙는다
+    url: jdbc:postgresql://${DB_HOST:localhost}:5432/postgres?ssl=true&sslmode=require
+  data:
+    redis:
+      host: localhost   # 로컬 Redis(예: docker run -p 6379:6379 redis:8.8). 테스트는 Testcontainers 가 덮어쓴다
+      port: 6379
+
+grpc:
+  ai:
+    # 운영 AI 서버(사설 IP)는 VPC 밖에서 닿지 않는다. 로컬에서 변환하려면 GRPC_AI_SERVERS 로 준다.
+    # gRPC 채널은 첫 요청 때 연결하므로 AI 가 없어도 기동 · 테스트는 된다
+    servers: ${GRPC_AI_SERVERS:localhost:50051:1}
+
+hwp2pdf:
+  script: ${HWP2PDF_SCRIPT:scripts/hwp2odt.py}   # 레포 루트에서 실행할 때의 경로

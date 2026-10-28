@@ -1,0 +1,342 @@
+package com.semojum.backend.domain.result.service;
+
+import com.google.protobuf.util.JsonFormat;
+import com.semojum.backend.domain.billing.repository.CreditTransactionRepository;
+import com.semojum.backend.domain.billing.service.CreditDeductionService;
+import com.semojum.backend.domain.billing.service.UsageCostService;
+import com.semojum.backend.domain.job.entity.Job;
+import com.semojum.backend.domain.job.entity.Page;
+import com.semojum.backend.domain.job.repository.JobRepository;
+import com.semojum.backend.domain.job.repository.PageRepository;
+import com.semojum.backend.domain.result.entity.*;
+import com.semojum.backend.domain.result.repository.*;
+import com.semojum.backend.grpc.BrailleResponse;
+import com.semojum.backend.grpc.ProcessingMeta;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import com.semojum.backend.domain.job.service.JobRedisKeys;
+
+/**
+ * AI 결과 저장 — 쪽 하나의 응답(블록 · 규정 · bbox · 품질 · 원가)을 저장하고 크레딧을 차감한 뒤 작업 종료를 판정한다.
+ *
+ * <ul>
+ *   <li>전 쪽이 끝났을 때 성공 0이면 FAILED, 1건 이상이면 COMPLETED(부분 성공 = 완료)</li>
+ *   <li>⚠️ {@code touchJob} · {@code finishJob}의 상태 가드({@code WHERE status IN ('PENDING','IN_PROGRESS')})를 빼지 말 것 — 끝난 작업을 쪽 이벤트가 되살린다</li>
+ *   <li>크레딧은 성공한 쪽만, {@code (job_id, page_no)} 단위로 한 번만 차감한다(워커 재시도에도 이중 차감 없음)</li>
+ *   <li>rule_trail proto 필드 개명(title→rule_name, excerpt→contents)은 여기서만 매핑한다 — DB · API 필드명은 그대로</li>
+ * </ul>
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class ResultService {
+
+    private final JobRepository jobRepository;
+    private final PageRepository pageRepository;
+    private final PageResultRepository pageResultRepository;
+    private final TextElementRepository textElementRepository;
+    private final BoundingBoxRepository boundingBoxRepository;
+    private final RuleTrailRepository ruleTrailRepository;
+    private final QualityCriticalErrorRepository qualityCriticalErrorRepository;
+    private final QualityReviewFlagRepository qualityReviewFlagRepository;
+    private final RedisTemplate<String, String> redisTemplate;
+    private final UsageCostService usageCostService;
+    private final CreditTransactionRepository creditTransactionRepository;
+    private final CreditDeductionService creditDeductionService;
+
+    @Transactional
+    public void save(BrailleResponse response) {
+        String jobId = response.getJobId();
+        int pageNumber = response.getPageNumber();
+        String status = response.getStatus();
+
+        // Job, Page 조회
+        Job job = jobRepository.findById(jobId)
+                .orElseThrow(() -> new RuntimeException("Job not found: " + jobId));
+        Page page = pageRepository.findByJobAndPageNo(job, pageNumber)
+                .orElseThrow(() -> new RuntimeException("Page not found: " + jobId + ", pageNo=" + pageNumber));
+
+        // raw_response 직렬화
+        String rawResponse;
+        try {
+            rawResponse = JsonFormat.printer().print(response);
+        } catch (Exception e) {
+            rawResponse = "{}";
+            log.warn("BrailleResponse JSON 직렬화 실패: {}", e.getMessage());
+        }
+
+        // ProcessingMeta 파싱
+        Integer processingTimeMs = null;
+        Double pdfLayerConfidence = null;
+        String routingTierUsed = null;
+        Boolean scanOnly = null;
+        if (response.hasProcessingMeta()) {
+            ProcessingMeta meta = response.getProcessingMeta();
+            processingTimeMs = meta.getProcessingTimeMs() > 0 ? meta.getProcessingTimeMs() : null;
+            pdfLayerConfidence = meta.getPdfLayerConfidence() > 0 ? (double) meta.getPdfLayerConfidence() : null;
+            routingTierUsed = meta.getRoutingTierUsed().isEmpty() ? null : meta.getRoutingTierUsed();
+            scanOnly = meta.getScanOnly();
+        }
+
+        // UsageReport → 원가·크레딧 계산. AI는 측정값만 주고 금액은 BE가 계산한다.
+        // 계산 실패가 변환 결과 저장을 막으면 안 되므로(비용 기록 < 결과 보존) 실패 시 null로 격하.
+        UsageCostService.CostBreakdown cost = null;
+        if (response.hasUsageReport()) {
+            try {
+                cost = usageCostService.calculate(response.getUsageReport());
+            } catch (Exception e) {
+                log.error("사용량 원가 계산 실패(결과 저장은 계속): jobId={}, pageNo={}, error={}",
+                        jobId, pageNumber, e.getMessage(), e);
+            }
+        }
+
+        // PageResult 저장
+        PageResult pageResult = PageResult.builder()
+                .job(job)
+                .page(page)
+                .pageNumber(pageNumber)
+                .mode(job.getMode())
+                .status(status)
+                .imageWidth(response.getImageWidth() > 0 ? response.getImageWidth() : null)
+                .imageHeight(response.getImageHeight() > 0 ? response.getImageHeight() : null)
+                .ocrConfidenceAvg(response.hasQualityReport() ? (double) response.getQualityReport().getOcrConfidenceAvg() : null)
+                // line_overflow_rate: proto에서 폐기(32칸 초과 판정은 조판 쪽 담당) — 신규 행은 null, 예전 행 값은 보존
+                .processingTimeMs(processingTimeMs)
+                .pdfLayerConfidence(pdfLayerConfidence)
+                .routingTierUsed(routingTierUsed)
+                .scanOnly(scanOnly)
+                .rawResponse(rawResponse)
+                .layoutType(cost != null ? cost.layoutType() : null)
+                .gpuTimeMs(cost != null ? cost.gpuTimeMs() : null)
+                .modelUsage(cost != null ? cost.modelUsage() : null)
+                .llmCostUsd(cost != null ? cost.llmCostUsd() : null)
+                .gpuCostUsd(cost != null ? cost.gpuCostUsd() : null)
+                .costKrw(cost != null ? cost.costKrw() : null)
+                .costUncertain(cost != null && cost.uncertain())
+                .pricingConfigId(cost != null ? cost.pricingConfigId() : null)
+                .build();
+        pageResultRepository.save(pageResult);
+
+        // TextElement 저장 (text_list)
+        for (com.semojum.backend.grpc.TextElement protoText : response.getTextListList()) {
+            List<Map<String, Object>> draftsJson = serializeDrafts(protoText);
+            TextElement textElement = TextElement.builder()
+                    .pageResult(pageResult)
+                    .elementId(protoText.getId())
+                    .type(protoText.getType().isEmpty() ? null : protoText.getType())
+                    .readingOrder(protoText.getOrder() > 0 ? protoText.getOrder() : null)
+                    .headingLevel(protoText.getHeadingLevel() > 0 ? protoText.getHeadingLevel() : null)
+                    .ocrConfidence(protoText.getOcrConfidence() > 0 ? (double) protoText.getOcrConfidence() : null)
+                    .tnText(protoText.getTnText().isEmpty() ? null : protoText.getTnText())
+                    .latexString(protoText.getLatexString().isEmpty() ? null : protoText.getLatexString())
+                    .selectedIdx(protoText.getSelectedIdx())
+                    .renderMode(protoText.getRenderMode().isEmpty() ? null : protoText.getRenderMode())
+                    .visualSubtype(protoText.getVisualSubtype().isEmpty() ? null : protoText.getVisualSubtype())
+                    .subtypeConfidence(protoText.getSubtypeConfidence() > 0 ? (double) protoText.getSubtypeConfidence() : null)
+                    .contents(new ArrayList<>(protoText.getContentsList()))
+                    .drafts(draftsJson)
+                    .isBlocked(protoText.getIsBlocked())
+                    .build();
+            textElementRepository.save(textElement);
+
+            // RuleTrail 저장
+            for (com.semojum.backend.grpc.RuleTrail protoRule : protoText.getRuleTrailList()) {
+                ruleTrailRepository.save(buildRuleTrail(protoRule, textElement.getId(), "TEXT"));
+            }
+        }
+
+        // 점자(braille_text_list)는 저장하지 않는다 — proto에서 삭제됐다(reserved 9).
+        // AI는 교열한 묵자만 돌려주고 점역은 앱이 엔진으로 직접 한다. 그래서 새 작업의
+        // braille_elements는 비어 있고 화면·SSE의 점자 배열도 빈 채로 나간다. 기존 작업의 점자는 그대로다.
+        //
+        // table_source · table_box_level(17·18)은 칼럼을 아직 만들지 않았다. 응답 전체를
+        // raw_response에 JSON으로 담고 있어 값은 버려지지 않는다 — 앱이 쓰겠다고 하면 그때 꺼낸다.
+
+        // BoundingBox 저장 (mode a, c)
+        for (com.semojum.backend.grpc.BoundingBox protoBbox : response.getBoundingBoxListList()) {
+            BoundingBox boundingBox = BoundingBox.builder()
+                    .pageResult(pageResult)
+                    .elementId(protoBbox.getId())
+                    .x(protoBbox.getX())
+                    .y(protoBbox.getY())
+                    .x2(protoBbox.getX2())
+                    .y2(protoBbox.getY2())
+                    .type(protoBbox.getType().isEmpty() ? null : protoBbox.getType())
+                    .headingLevel(protoBbox.getHeadingLevel() > 0 ? protoBbox.getHeadingLevel() : null)
+                    .captionRef(protoBbox.getCaptionRef().isEmpty() ? null : protoBbox.getCaptionRef())
+                    .flags(protoBbox.getFlagsList().isEmpty() ? null : new ArrayList<>(protoBbox.getFlagsList()))
+                    .build();
+            boundingBoxRepository.save(boundingBox);
+        }
+
+        // QualityCriticalError 저장
+        if (response.hasQualityReport()) {
+            for (com.semojum.backend.grpc.CriticalError protoError : response.getQualityReport().getCriticalErrorsList()) {
+                QualityCriticalError error = QualityCriticalError.builder()
+                        .pageResult(pageResult)
+                        .type(protoError.getType())
+                        .elementId(protoError.getElementId())
+                        .message(protoError.getMessage())
+                        .build();
+                qualityCriticalErrorRepository.save(error);
+            }
+
+            // QualityReviewFlag 저장
+            for (com.semojum.backend.grpc.ReviewFlag protoFlag : response.getQualityReport().getReviewFlagsList()) {
+                QualityReviewFlag flag = QualityReviewFlag.builder()
+                        .pageResult(pageResult)
+                        .type(protoFlag.getType())
+                        .elementId(protoFlag.getElementId())
+                        .message(protoFlag.getMessage())
+                        .build();
+                qualityReviewFlagRepository.save(flag);
+            }
+        }
+
+        // Page 상태 업데이트
+        page.updateStatus(status);
+        pageRepository.save(page);
+
+        // 크레딧 차감 기록 — 성공한 쪽만(실패 쪽 무차감). UNSPECIFIED의 0 차감도 기록(고객 검산용).
+        // 출처(쿠폰 우선/계약) 판정은 CreditDeductionService.
+        // 워커 재시도로 save()가 같은 페이지에 재진입해도 이중 차감되지 않게 멱등 처리.
+        if (cost != null && Page.SUCCESS_STATUSES.contains(status)
+                && !creditTransactionRepository.existsByJobIdAndPageNo(jobId, pageNumber)) {
+            creditDeductionService.deduct(job.getUser(), jobId, pageNumber, cost.layoutType(), cost.credit());
+        }
+
+        // PENDING→IN_PROGRESS 전이 + updated_at 갱신 (이미 종료된 Job은 가드로 보호)
+        jobRepository.touchJob(jobId);
+
+        // 종료 판정 (BLOCKED 경로와 공유)
+        evaluateJobTermination(job, jobId);
+
+        log.info("ResultService 저장 완료: jobId={}, pageNo={}, status={}", jobId, pageNumber, status);
+    }
+
+    // 페이지가 최대 재시도 초과로 BLOCKED 될 때 DB에 즉시 반영하는 경로 (PageWorker에서 호출).
+    // self-invocation 무력화를 피하기 위해 PageWorker가 이 빈의 public 메서드를 직접 호출한다.
+    @Transactional
+    public void markPageBlocked(String jobId, int pageNo) {
+        markPageBlocked(jobId, pageNo, null);
+    }
+
+    /** @param reason 차단 사유({@link Page#BLOCKED_CREDIT_EXHAUSTED} 등). null = 사유 없음 */
+    @Transactional
+    public void markPageBlocked(String jobId, int pageNo, String reason) {
+        Job job = jobRepository.findById(jobId)
+                .orElseThrow(() -> new RuntimeException("Job not found: " + jobId));
+        Page page = pageRepository.findByJobAndPageNo(job, pageNo)
+                .orElseThrow(() -> new RuntimeException("Page not found: " + jobId + ", pageNo=" + pageNo));
+
+        page.block(reason);
+        pageRepository.save(page);
+
+        // updated_at 갱신 + 종료 판정 (성공 경로와 동일)
+        jobRepository.touchJob(jobId);
+        evaluateJobTermination(job, jobId);
+
+        log.info("Page BLOCKED 처리: jobId={}, pageNo={}, reason={}", jobId, pageNo, reason);
+    }
+
+    // 성공 경로와 BLOCKED 경로가 공유하는 Job 종료 판정.
+    // 모든 페이지가 terminal(COMPLETED/NEEDS_REVIEW/BLOCKED)일 때만 종료하며,
+    // 성공(COMPLETED/NEEDS_REVIEW)이 하나도 없고 전부 BLOCKED면 FAILED, 하나라도 성공이면 COMPLETED.
+    private void evaluateJobTermination(Job job, String jobId) {
+        long terminalCount = pageRepository.countByJobAndStatusIn(job, Page.TERMINAL_STATUSES);
+        if (terminalCount != job.getTotalPages()) {
+            return;
+        }
+
+        long successCount = pageRepository.countByJobAndStatusIn(job, Page.SUCCESS_STATUSES);
+        List<Page> blockedPages = pageRepository.findByJobAndStatus(job, "BLOCKED");
+        int[] failedPageNos = blockedPages.stream()
+                .mapToInt(Page::getPageNo)
+                .toArray();
+
+        String newStatus = successCount == 0 ? "FAILED" : "COMPLETED";
+        jobRepository.finishJob(jobId, newStatus, toPgIntArray(failedPageNos));
+        // Job 전체 종료 확정 → 페이지 상태 Hash에 TTL 1시간 부여 (완료 후 자동 삭제, Redis 메모리 누수 방지)
+        redisTemplate.expire(JobRedisKeys.pages(jobId), Duration.ofHours(1));
+        log.info("Job 종료 판정: jobId={}, status={}, failedPages={}", jobId, newStatus, failedPageNos.length);
+    }
+
+    // int[] → PostgreSQL integer[] 텍스트 리터럴('{1,2,3}'). 값은 페이지 번호(정수)라 인젝션 위험 없음.
+    private String toPgIntArray(int[] nums) {
+        StringBuilder sb = new StringBuilder("{");
+        for (int i = 0; i < nums.length; i++) {
+            if (i > 0) sb.append(",");
+            sb.append(nums[i]);
+        }
+        return sb.append("}").toString();
+    }
+
+    private RuleTrail buildRuleTrail(com.semojum.backend.grpc.RuleTrail protoRule, UUID elementId, String elementType) {
+        return RuleTrail.builder()
+                .elementId(elementId)
+                .elementType(elementType)
+                .ruleId(protoRule.getRuleId())
+                .source(protoRule.getSource().isEmpty() ? null : protoRule.getSource())
+                .priority(protoRule.getPriority().isEmpty() ? null : protoRule.getPriority())
+                .section(protoRule.getSection())
+                // proto가 title→rule_name, excerpt→contents로 개명했다(필드 번호는 그대로라 값은 동일).
+                // DB·응답 이름은 그대로 두고 여기서만 맞춘다 — 이미 나가는 API 필드명을 흔들지 않기 위해서다.
+                .title(protoRule.getRuleName())
+                .excerpt(protoRule.getContents())
+                .lineNo(protoRule.getLineNo())
+                .colStart(protoRule.getColStart() >= 0 ? protoRule.getColStart() : null)
+                .colEnd(protoRule.getColEnd() >= 0 ? protoRule.getColEnd() : null)
+                .tag(protoRule.getTag().isEmpty() ? null : protoRule.getTag())
+                .publisher(protoRule.getPublisher().isEmpty() ? null : protoRule.getPublisher())
+                .version(protoRule.getVersion() > 0 ? protoRule.getVersion() : null)
+                .sectionPath(buildSectionPath(protoRule))
+                .build();
+    }
+
+    /** 조문 경로 — 값이 있는 단계만 담는다(proto는 없는 단계를 ""로 준다). 전부 비면 null */
+    private Map<String, String> buildSectionPath(com.semojum.backend.grpc.RuleTrail protoRule) {
+        if (!protoRule.hasPath()) return null;
+        com.semojum.backend.grpc.SectionPath path = protoRule.getPath();
+        Map<String, String> map = new LinkedHashMap<>();
+        putIfPresent(map, "part", path.getPart());
+        putIfPresent(map, "chapter", path.getChapter());
+        putIfPresent(map, "section", path.getSection());
+        putIfPresent(map, "paragraph", path.getParagraph());
+        putIfPresent(map, "subparagraph", path.getSubparagraph());
+        putIfPresent(map, "item", path.getItem());
+        return map.isEmpty() ? null : map;
+    }
+
+    private void putIfPresent(Map<String, String> map, String key, String value) {
+        if (value != null && !value.isEmpty()) map.put(key, value);
+    }
+
+    // Drafts 변환 헬퍼: proto Draft(text/label/tn_text) → List<Map>.
+    // jsonb 배열로 저장되고 조회 시 그대로 배열로 응답됨(문자열 이중 인코딩 방지).
+    // 점자 contents(2)는 빠졌고(reserved) 점역 태그가 든 묵자 tn_text(4)가 있다 —
+    // 앱이 그 묵자로 직접 점역한다. 예전 행의 contents는 그대로 남아 있다.
+    private List<Map<String, Object>> serializeDrafts(com.semojum.backend.grpc.TextElement protoText) {
+        if (protoText.getDraftsList().isEmpty()) return null;
+        List<Map<String, Object>> drafts = new ArrayList<>();
+        for (com.semojum.backend.grpc.Draft draft : protoText.getDraftsList()) {
+            Map<String, Object> map = new LinkedHashMap<>();
+            map.put("text", draft.getText());
+            map.put("label", draft.getLabel());
+            map.put("tn_text", draft.getTnText());
+            drafts.add(map);
+        }
+        return drafts;
+    }
+
+
+}

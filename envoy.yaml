@@ -1,0 +1,146 @@
+# 블루그린 무중단 배포용 설정 (2026-08-16)
+# - 클러스터에 blue/green 두 엔드포인트 — 액티브 헬스체크(/api/health, 3초)로 살아있는 쪽에만 라우팅
+# - 꺼져 있는 색은 DNS 미해석·헬스 실패로 자동 제외되고, 새로 뜨면 재조회(5초)로 자동 편입
+# - 재시도는 connect-failure·refused-stream만: 요청이 백엔드에 "도달하기 전" 실패라 재시도해도
+#   중복 실행이 없다 (5xx 재시도는 POST 중복 실행 위험이 있어 넣지 않는다)
+# - SSE: timeout 0s(무제한) 유지 — 변경 금지. idle_timeout은 600s (2026-09-19, 10800s에서 단축)
+#   우리 스트림의 최대 무음 구간은 쪽 하나의 처리 시간이고 그것은 gRPC deadline 400s로 상한이
+#   묶인다(grpc.ai.deadline-seconds). 600s면 1.5배 여유다. 종전 10800s는 EMITTER_TIMEOUT에
+#   맞춘 값이었는데, 그 탓에 죽은 연결이 최대 3시간 남았다. 서버 하트비트(30s)가 연결 생사를
+#   따로 확인하므로 idle_timeout까지 길게 둘 이유가 없다
+# - 443 TLS 직접 종료 (2026-08-26): Cloudflare 프록시 경유(미국 엣지, 요청당 +0.7s)를 걷어내고
+#   Let's Encrypt 인증서(certbot, 자동 갱신 + deploy hook이 tls/ 갱신·Envoy 재시작)로 직접 서빙.
+#   80은 ACME 챌린지 통로 + 구형 클라이언트용으로 유지
+static_resources:
+  listeners:
+    - name: listener_https
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 443
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                alpn_protocols: ["h2", "http/1.1"]
+                tls_certificates:
+                  - certificate_chain:
+                      filename: /etc/envoy/tls/fullchain.pem
+                    private_key:
+                      filename: /etc/envoy/tls/privkey.pem
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_https
+                route_config:
+                  name: local_route_https
+                  virtual_hosts:
+                    - name: local_service_https
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: spring_boot
+                            timeout: 0s
+                            idle_timeout: 600s
+                            retry_policy:
+                              retry_on: "connect-failure,refused-stream"
+                              num_retries: 2
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+    - name: listener_0
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 80
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: local_service
+                      domains: ["*"]
+                      routes:
+                        # Let's Encrypt HTTP-01 갱신 챌린지 — 호스트의 certbot(--http-01-port 8888)으로 전달.
+                        # certbot이 안 떠 있을 땐 503이지만 챌린지 시각에만 쓰이는 경로라 무해
+                        - match:
+                            prefix: "/.well-known/acme-challenge/"
+                          route:
+                            cluster: acme_certbot
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: spring_boot
+                            timeout: 0s
+                            idle_timeout: 600s
+                            retry_policy:
+                              retry_on: "connect-failure,refused-stream"
+                              num_retries: 2
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    # 호스트에서 실행되는 certbot standalone(포트 8888) — compose 네트워크 게이트웨이로 접근
+    - name: acme_certbot
+      connect_timeout: 1s
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: acme_certbot
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 172.18.0.1
+                      port_value: 8888
+
+    - name: spring_boot
+      connect_timeout: 0.25s
+      type: STRICT_DNS
+      # 꺼진 색의 DNS 미해석을 빨리 반영/복구
+      dns_refresh_rate: 5s
+      respect_dns_ttl: false
+      lb_policy: ROUND_ROBIN
+      health_checks:
+        - timeout: 2s
+          interval: 3s
+          healthy_threshold: 2
+          unhealthy_threshold: 2
+          http_health_check:
+            path: /api/health
+            # host 미지정 시 Envoy가 클러스터명(spring_boot)을 Host 헤더로 보내는데, Tomcat은
+            # Host의 밑줄(_)을 RFC 위반으로 400 거부 → HC가 도입(08-16) 이래 영구 실패였고
+            # 패닉 라우팅(전원 unhealthy면 건강 무시 배분)이 몰래 서비스를 지탱해왔다(2026-08-26 발견).
+            # 그 부작용이 배포 후 죽은 색 잔존 엔드포인트로의 라우팅 = 요청당 +250ms.
+            # 밑줄 없는 host를 명시해 HC를 실제로 통과시킨다 — 이제 죽은 색은 정상 배제된다
+            host: backend
+      # 두 색이 잠깐 같이 healthy면 트래픽이 반씩 나뉜다 — 전환 중 몇 초뿐이라 무해
+      # (deploy.sh가 헬스 통과 후 구 색을 바로 내림)
+      load_assignment:
+        cluster_name: spring_boot
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: backend-blue
+                      port_value: 8080
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: backend-green
+                      port_value: 8080
