@@ -46,7 +46,7 @@ AI 결과는 쪽 전체가 한 덩어리 글로 오지 않고 **제목 · 본문
 | Database | PostgreSQL 18 (AWS RDS, private subnet), Flyway |
 | Cache · Queue | Redis (작업 큐 · 스케줄러 링 · 진행 상태 · 로그인 잠금) |
 | Storage | AWS S3 (EC2 IAM Role 키리스 인증, presigned URL) |
-| 통신 | gRPC + TLS (AI 서버), SSE (실시간 진행 상황) |
+| 통신 | gRPC + TLS (GPU 추론서버), SSE (실시간 진행 상황) |
 | 인증 | JWT (jjwt) Access/Refresh, BCrypt, 세션 테이블 |
 | 문서 처리 | OpenPDF, PDFBox, poppler(`pdftoppm`), hwplib, pyhwp + LibreOffice |
 | Infra · CI/CD | AWS EC2 · RDS · S3 · ECR, Docker Compose, Envoy, GitHub Actions (OIDC) |
