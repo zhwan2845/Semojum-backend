@@ -231,6 +231,6 @@ export DB_HOST=localhost DB_PASSWORD=... JWT_SECRET=... GRPC_CERT_PATH=file:/pat
 | 내부 운영 문서(인프라 구성 · 계정 · 주소가 담긴 개발 가이드) | 삭제 |
 | 운영 DB · S3에 직접 붙는 스모크 테스트 스크립트 | 삭제 |
 | AWS 계정 ID · IAM 역할 ARN | GitHub Secrets 참조로 대체 |
-| 서버 · AI 서버 · 콘솔 IP, 서비스 도메인, S3 버킷 이름 | 예시 값(`example.com`, 문서용 IP 대역)으로 대체 |
+| 서비스 서버 · GPU 추론서버 · 콘솔 IP, 서비스 도메인, S3 버킷 이름 | 예시 값(`example.com`, 문서용 IP 대역)으로 대체 |
 | gRPC 테스트용 인증서 · 키 | 공개 버전용으로 새로 만든 자체 서명 인증서로 교체 |
 | 커밋 이력 | 포함하지 않음 (원본 저장소의 이력에는 과거 설정이 남아 있어 단일 커밋으로 올림) |
