@@ -93,7 +93,7 @@ AI 결과는 쪽 전체가 한 덩어리 글로 오지 않고 **제목 · 본문
 
 ## 4. 주요 구현 내용
 
-### 4-1. 공정한 작업 스케줄링 — 한 사람의 큰 작업이 모두를 막지 않게
+### 4-1. 공정한 작업 스케줄링 — 한 사람의 대형 작업이 전부를 막지 않게
 
 > [`JobDispatcher`](src/main/java/com/semojum/backend/domain/job/scheduler/JobDispatcher.java) · [`PageWorker`](src/main/java/com/semojum/backend/domain/job/worker/PageWorker.java)
 
