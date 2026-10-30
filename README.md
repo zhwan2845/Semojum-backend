@@ -13,8 +13,8 @@
 **세모점**은 이 과정을 AI로 줄입니다.
 
 1. 점역사가 PDF · HWP · HWPX · TXT · 이미지를 올리면
-2. 서버가 쪽 단위로 나눠 AI 서버(GPU)에 보내 **텍스트를 추출 · 교열**하고
-3. 쪽이 끝날 때마다 **실시간(SSE)** 으로 데스크톱 앱에 흘려보내면
+2. 서버가 쪽 단위로 나눠 GPU 추론서버에 보내 **텍스트를 추출 · 교열**하고
+3. 쪽이 끝날 때마다 **실시간(SSE)** 으로 데스크톱 앱에 보내면
 4. 점역사는 **원본 | 텍스트 | 점자 3패널 에디터**에서 결과를 검수 · 수정하고
 5. 앱이 점자 규정에 맞춰 점역 · 조판해 `.brf` 점자 파일로 출력합니다.
 
@@ -43,7 +43,7 @@ AI 결과는 쪽 전체가 한 덩어리 글로 오지 않고 **제목 · 본문
 | 구분 | 기술 |
 |---|---|
 | Language · Framework | Java 21, Spring Boot 3.5, Spring Security, Spring Data JPA |
-| Database | PostgreSQL 18 (AWS RDS, private subnet), Flyway (마이그레이션 43개) |
+| Database | PostgreSQL 18 (AWS RDS, private subnet), Flyway |
 | Cache · Queue | Redis (작업 큐 · 스케줄러 링 · 진행 상태 · 로그인 잠금) |
 | Storage | AWS S3 (EC2 IAM Role 키리스 인증, presigned URL) |
 | 통신 | gRPC + TLS (AI 서버), SSE (실시간 진행 상황) |
@@ -68,7 +68,7 @@ AI 결과는 쪽 전체가 한 덩어리 글로 오지 않고 **제목 · 본문
                                   │
         ┌───────────────┬─────────┼──────────────┬──────────────────────┐
         ▼               ▼         ▼              ▼                      ▼
-   PostgreSQL         Redis       S3       AI 서버 (GPU)            IMAP 메일함
+   PostgreSQL         Redis       S3       GPU 추론서버            IMAP 메일함
   (작업 · 결과 ·   (공정 큐 ·  (원본 ·    gRPC/TLS, 사설 IP       (문의 폴링,
    크레딧 · 통계)   진행 상태)  미리보기)  슬롯 수 = 워커 수          읽기 전용)
 ```
@@ -84,7 +84,7 @@ AI 결과는 쪽 전체가 한 덩어리 글로 오지 않고 **제목 · 본문
                 │
      CreditGate: 기관 잔여 크레딧 확인 (부족하면 한 쪽씩 / 소진되면 차단)
                 │
-     PageWorker × N (AI 슬롯 수만큼) ──gRPC──▶ AI 서버
+     PageWorker × N (AI 슬롯 수만큼) ──gRPC──▶ GPU 추론서버
                 │
      ResultService: 결과 저장 · 원가 계산 · 크레딧 차감 ──▶ SSE page_done (쪽 순서대로)
 ```
@@ -100,7 +100,7 @@ AI 결과는 쪽 전체가 한 덩어리 글로 오지 않고 **제목 · 본문
 - 300쪽짜리 문서 하나가 AI 슬롯을 독점하면 뒤에 온 사람은 몇십 분을 기다려야 합니다. 그래서 **작업마다 큐(`queue:job:{id}`)를 따로 두고, 유저 링 → 작업 링 → 쪽 1장 순서의 2계층 라운드로빈**으로 꺼냅니다. 사용자 간, 그리고 한 사용자의 여러 작업 간에 차례가 돌아갑니다.
 - 지금 화면을 보고 있는 작업(Foreground)을 먼저 처리합니다. SSE 연결 · 상태 폴링이 TTL 30초짜리 리스 키를 갱신하고, FG:BG를 4:1로 섞어 백그라운드 작업도 굶지 않게 했습니다.
 - 링과 큐를 모두 Redis에 두어 **서버를 재시작해도 대기 중인 쪽이 이어서 처리**됩니다.
-- **워커 수 = AI 서버 총 슬롯 수**입니다. 워커 하나가 슬롯 하나를 잡고 블로킹 gRPC를 호출하므로 AI 서버에 과부하를 주지 않습니다. AI 서버 증설은 `host:port:슬롯수` 환경변수만 바꾸면 됩니다([`AiServerPool`](src/main/java/com/semojum/backend/global/grpc/AiServerPool.java)).
+- **워커 수 = GPU 추론서버 총 슬롯 수**입니다. 워커 하나가 슬롯 하나를 잡고 블로킹 gRPC를 호출하므로 GPU 추론서버에 과부하를 주지 않습니다. GPU 추론서버 증설은 `host:port:슬롯수` 환경변수만 바꾸면 됩니다([`AiServerPool`](src/main/java/com/semojum/backend/global/grpc/AiServerPool.java)).
 - 오류가 나면 큐 **머리**에 다시 넣어(순서 유지) 최대 3회 재시도하고, 그래도 실패하면 그 쪽만 BLOCKED 처리합니다. 한 쪽이 실패해도 작업 전체는 **부분 성공 = 완료**로 끝납니다.
 
 ### 4-2. 실시간 진행 상황(SSE) — 병렬 처리지만 쪽 순서는 보장
@@ -108,15 +108,15 @@ AI 결과는 쪽 전체가 한 덩어리 글로 오지 않고 **제목 · 본문
 > [`SseService`](src/main/java/com/semojum/backend/domain/job/service/SseService.java)
 
 - 쪽은 병렬로 처리되어 3쪽이 1쪽보다 먼저 끝날 수 있습니다. 에디터는 앞쪽부터 채워야 하므로 **커서 방식으로 `page_done`을 1, 2, 3… 순서대로만 내보내고**, 재연결 시 완료분을 순서대로 다시 보냅니다.
-- 마지막 쪽들이 모두 AI에 들어가 있으면 최대 수백 초 동안 보낼 것이 없어 끊긴 연결을 알 수 없었습니다. **30초 하트비트(`: ping`)** 로 죽은 연결을 드러냅니다.
+- 마지막 쪽들이 모두 GPU 추론서버에 들어가 있으면 최대 수백 초 동안 보낼 것이 없어 끊긴 연결을 알 수 없었습니다. **30초 하트비트(`: ping`)** 로 죽은 연결을 드러냅니다.
 - 진행 상태 Hash는 종료 1시간 뒤 사라집니다. 그 뒤에 붙은 연결이 "아직 시작 전"과 구분되지 않아 몇 시간씩 매달리던 문제가 있어, **Hash가 비면 DB로 상태를 확인해 즉시 종료**하게 고쳤습니다.
 - `spring.jpa.open-in-view=false`로 두어 긴 SSE 연결이 DB 커넥션을 붙잡지 않게 했습니다.
 
-### 4-3. 크레딧 · 원가 계산 — 숫자가 조용히 틀리지 않게
+### 4-3. 크레딧 · 원가 계산 — 숫자가 틀리지 않게
 
 > [`CreditGate`](src/main/java/com/semojum/backend/domain/job/scheduler/CreditGate.java) · [`CreditBalanceService`](src/main/java/com/semojum/backend/domain/billing/service/CreditBalanceService.java) · [`CreditDeductionService`](src/main/java/com/semojum/backend/domain/billing/service/CreditDeductionService.java) · [`UsageCostService`](src/main/java/com/semojum/backend/domain/billing/service/UsageCostService.java)
 
-- AI 서버는 **측정값(토큰 수 · GPU 시간 · 쪽 레이아웃 종류)만** 보내고, 금액과 크레딧은 BE가 계산합니다.
+- GPU 추론서버는 **측정값(토큰 수 · GPU 시간 · 쪽 레이아웃 종류)만** 보내고, 금액과 크레딧은 서비스 서버가 계산합니다.
 - 단가 · 환율 · 배율은 코드가 아니라 `pricing_configs` 테이블에 두고, **수정은 새 행 추가**로만 합니다. 각 쪽 결과가 계산에 쓴 단가표를 가리키고 원자료도 함께 저장해, 단가가 바뀌어도 과거 기록이 변하지 않고 재검산할 수 있습니다.
 - 단가표에 없는 모델은 0원으로 처리하지 않고 `cost_uncertain=true`로 표시합니다.
 - 크레딧은 **성공한 쪽만** 레이아웃별 배율(텍스트 1 · 수식 2 · 표 3 · 그림 5)로 차감합니다. `(job_id, page_no)` 유니크 제약으로 **워커가 재시도해도 이중 차감이 불가능**합니다. 0 차감도 고객 검산용으로 기록합니다.
@@ -147,7 +147,7 @@ AI 결과는 쪽 전체가 한 덩어리 글로 오지 않고 **제목 · 본문
 > [`LoginAttemptService`](src/main/java/com/semojum/backend/domain/auth/service/LoginAttemptService.java) · [`global/jwt`](src/main/java/com/semojum/backend/global/jwt) · [`global/config`](src/main/java/com/semojum/backend/global/config)
 
 - JWT Access(1시간) / Refresh(12시간)와 세션 테이블을 함께 씁니다. 로그인하면 기존 세션을 모두 끊어 **중복 로그인을 막습니다**.
-- **로그인 5회 실패 시 10분 잠금**(Redis TTL). 존재하지 않는 ID도 똑같이 세어 응답만으로 **ID 존재 여부를 알 수 없게** 했습니다.
+- **로그인 5회 실패 시 10분 잠금**(Redis TTL).
 - 운영자 계정을 웹 콘솔용과 앱용으로 나누고, 로그인 요청의 Origin으로 콘솔 로그인인지 판별합니다.
 - 기관 계정을 잠그면 즉시 세션을 끊고 **진행 중인 변환도 취소**합니다. 쪽 단위로 차감하므로 완료된 쪽까지만 차감됩니다.
 - 열람 범위를 역할별로 제한합니다. 기관 관리자는 파일 내용과 접속 정보를, 점역사는 다른 계정의 개별 사용량을 볼 수 없습니다.
@@ -220,7 +220,7 @@ export DB_HOST=localhost DB_PASSWORD=... JWT_SECRET=... GRPC_CERT_PATH=file:/pat
 ```
 
 - 프로파일을 지정하지 않으면 `local`로 뜹니다. 비밀값은 어떤 설정 파일에도 두지 않고 환경변수로만 받습니다.
-- AI 서버(별도 팀 저장소)와 점자 규정 데이터(비공개)는 이 레포에 포함되지 않습니다. 없어도 서버는 기동되며, 변환 · 규정 검색만 동작하지 않습니다.
+- GPU 추론서버와 점자 규정 데이터(비공개)는 이 레포에 포함되지 않습니다. 없어도 서버는 기동되며, 변환 · 규정 검색만 동작하지 않습니다.
 
 <br>
 
