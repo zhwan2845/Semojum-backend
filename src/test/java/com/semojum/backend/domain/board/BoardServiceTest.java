@@ -170,7 +170,7 @@ class BoardServiceTest {
 
         for (User u : List.of(other, admin)) {   // 운영자도 남의 글 본문은 못 고친다 — 숨김·삭제만
             CustomException e = assertThrows(CustomException.class,
-                    () -> service.update(id(u), 126L, "제목", "본문", false, null, null));
+                    () -> service.update(id(u), 126L, "제목", "본문", null, false, null, null));
             assertEquals(ErrorCode.COMMON_FORBIDDEN, e.getErrorCode());
         }
         CustomException e = assertThrows(CustomException.class, () -> service.delete(id(other), 126L));
@@ -181,7 +181,7 @@ class BoardServiceTest {
     void 내_글은_고치고_지울_수_있다() {
         BoardPost p = post(author, false);
 
-        BoardDto.PostDetail d = service.update(id(author), 126L, "새 제목", "새 본문", true, null, null);
+        BoardDto.PostDetail d = service.update(id(author), 126L, "새 제목", "새 본문", null, true, null, null);
         assertEquals("새 제목", d.title());
         assertTrue(d.secret());
 
@@ -278,14 +278,14 @@ class BoardServiceTest {
         for (int i = 0; i < 6; i++) six.add(file("a" + i + ".png", 10));
 
         CustomException e = assertThrows(CustomException.class,
-                () -> service.create(id(author), "제목", "본문", false, six));
+                () -> service.create(id(author), "제목", "본문", null, false, six));
         assertEquals(ErrorCode.BOARD_ATTACHMENT_INVALID, e.getErrorCode());
         verify(postRepository, never()).save(any());
     }
 
     @Test
     void 첨부_한_개가_10MB를_넘으면_413이다() {
-        CustomException e = assertThrows(CustomException.class, () -> service.create(id(author), "제목", "본문",
+        CustomException e = assertThrows(CustomException.class, () -> service.create(id(author), "제목", "본문", null,
                 false, List.of(file("big.pdf", 10 * 1024 * 1024 + 1))));
         assertEquals(ErrorCode.BOARD_ATTACHMENT_TOO_LARGE, e.getErrorCode());
     }
@@ -294,7 +294,7 @@ class BoardServiceTest {
     void 실행_파일은_받지_않는다() {
         for (String name : List.of("setup.exe", "run.sh", "noext")) {
             CustomException e = assertThrows(CustomException.class,
-                    () -> service.create(id(author), "제목", "본문", false, List.of(file(name, 10))));
+                    () -> service.create(id(author), "제목", "본문", null, false, List.of(file(name, 10))));
             assertEquals(ErrorCode.BOARD_ATTACHMENT_INVALID, e.getErrorCode(), name);
         }
     }
@@ -302,7 +302,7 @@ class BoardServiceTest {
     /** 앱이 만든 「현재 작업 정보」 파일도 일반 첨부로 받는다 */
     @Test
     void 첨부는_S3에_올리고_원래_이름을_기록한다() {
-        service.create(id(author), "제목", "본문", false, List.of(file("작업정보_2026-10-06.txt", 2150)));
+        service.create(id(author), "제목", "본문", null, false, List.of(file("작업정보_2026-10-06.txt", 2150)));
 
         verify(s3Service).uploadFile(startsWith("board/128/"), any(), any());
         verify(attachmentRepository).save(argThat(a -> a.getFileName().equals("작업정보_2026-10-06.txt")
@@ -322,12 +322,12 @@ class BoardServiceTest {
         }
         when(attachmentRepository.findByPostIdOrderByIdAsc(126L)).thenReturn(current);
 
-        CustomException e = assertThrows(CustomException.class, () -> service.update(id(author), 126L, "제목", "본문",
+        CustomException e = assertThrows(CustomException.class, () -> service.update(id(author), 126L, "제목", "본문", null,
                 false, List.of(1L, 2L, 3L, 4L), List.of(file("a.png", 1), file("b.png", 1))));
         assertEquals(ErrorCode.BOARD_ATTACHMENT_INVALID, e.getErrorCode());
 
         // 둘을 빼면 둘을 더할 수 있다 — 뺀 것은 지운다
-        service.update(id(author), 126L, "제목", "본문", false, List.of(1L, 2L),
+        service.update(id(author), 126L, "제목", "본문", null, false, List.of(1L, 2L),
                 List.of(file("a.png", 1), file("b.png", 1)));
         verify(attachmentRepository).deleteAll(argThat(list -> ((List<?>) list).size() == 2));
     }
@@ -338,7 +338,7 @@ class BoardServiceTest {
     void 제목_100자_본문_10000자를_넘으면_400이다() {
         for (String[] bad : new String[][]{{" ", "본문"}, {"가".repeat(101), "본문"}, {"제목", "가".repeat(10_001)}}) {
             CustomException e = assertThrows(CustomException.class,
-                    () -> service.create(id(author), bad[0], bad[1], false, null));
+                    () -> service.create(id(author), bad[0], bad[1], null, false, null));
             assertEquals(ErrorCode.COMMON_BAD_REQUEST, e.getErrorCode());
         }
     }
@@ -346,36 +346,130 @@ class BoardServiceTest {
     @Test
     void 모르는_검색_범위는_400이다() {
         CustomException e = assertThrows(CustomException.class,
-                () -> service.list(id(author), 1, "BODY", "크레딧", false));
+                () -> service.list(id(author), 1, "BODY", "크레딧", false, false));
         assertEquals(ErrorCode.COMMON_BAD_REQUEST, e.getErrorCode());
     }
 
     /** 공지는 그냥 목록일 때만 위에 붙는다 — 검색 결과에 공지가 끼면 결과가 아니다 */
     @Test
     void 검색할_때는_공지를_붙이지_않는다() {
-        when(postRepository.search(any(), anyBoolean(), anyBoolean(), anyBoolean(), anyBoolean(), any(), any(), any()))
+        when(postRepository.search(any(), anyBoolean(), anyBoolean(), anyBoolean(), anyBoolean(), anyBoolean(), any(), any(), any()))
                 .thenReturn(new PageImpl<>(List.of()));
 
-        service.list(id(author), 1, null, "크레딧", false);
-        service.list(id(author), 1, null, null, true);
+        service.list(id(author), 1, null, "크레딧", false, false);
+        service.list(id(author), 1, null, null, true, false);
         verify(noticeRepository, never()).findPinnedForBoard(any(), any());
 
-        service.list(id(author), 1, null, null, false);
+        service.list(id(author), 1, null, null, false, false);
         verify(noticeRepository).findPinnedForBoard(any(), any());
     }
 
     /** 일반 사용자 목록엔 숨긴 글이 빠진다(admin=false), 운영자 콘솔은 포함 */
     @Test
     void 숨긴_글은_일반_목록에서_빠진다() {
-        when(postRepository.search(any(), anyBoolean(), anyBoolean(), anyBoolean(), anyBoolean(), any(), any(), any()))
+        when(postRepository.search(any(), anyBoolean(), anyBoolean(), anyBoolean(), anyBoolean(), anyBoolean(), any(), any(), any()))
                 .thenReturn(new PageImpl<>(List.of()));
 
-        service.list(id(author), 1, null, null, false);
-        verify(postRepository).search(eq(author.getId()), eq(false), eq(false), eq(false), eq(false),
+        service.list(id(author), 1, null, null, false, false);
+        verify(postRepository).search(eq(author.getId()), eq(false), eq(false), eq(false), eq(false), eq(false),
                 eq("TITLE_CONTENT"), eq("%"), any());
 
         service.listForAdmin(id(admin), 1, null, null, true);
-        verify(postRepository).search(eq(admin.getId()), eq(true), eq(false), eq(true), eq(false),
+        verify(postRepository).search(eq(admin.getId()), eq(true), eq(false), eq(true), eq(false), eq(false),
                 eq("TITLE_CONTENT"), eq("%"), any());
+    }
+
+    // ── 분류 · 답변 받은 글 ─────────────────────────────────────────
+
+    /** 분류를 안 보내는 구 앱도 글을 쓸 수 있다 — 피그마 기본값 「점역 결과」 */
+    @Test
+    void 분류를_안_보내면_점역_결과로_쓴다() {
+        service.create(id(author), "제목", "본문", null, false, null);
+        verify(postRepository).save(argThat(p -> "RESULT".equals(p.getCategory())));
+    }
+
+    @Test
+    void 보낸_분류로_쓰고_상세에_싣는다() {
+        service.create(id(author), "제목", "본문", "BILLING", false, null);
+        verify(postRepository).save(argThat(p -> "BILLING".equals(p.getCategory())));
+
+        BoardPost p = post(author, false);
+        ReflectionTestUtils.setField(p, "category", "ACCOUNT");
+        assertEquals("ACCOUNT", service.getPost(id(author), 126L).category());
+    }
+
+    @Test
+    void 모르는_분류는_400이다() {
+        CustomException e = assertThrows(CustomException.class,
+                () -> service.create(id(author), "제목", "본문", "ONBOARDING", false, null));
+        assertEquals(ErrorCode.COMMON_BAD_REQUEST, e.getErrorCode());
+    }
+
+    /** 분류를 모르는 구 앱이 고쳐도 원래 분류가 지워지지 않는다 */
+    @Test
+    void 수정에서_분류를_안_보내면_원래_분류를_지킨다() {
+        BoardPost p = post(author, false);
+        ReflectionTestUtils.setField(p, "category", "USAGE");
+        assertEquals("USAGE", service.update(id(author), 126L, "제목", "본문", null, false, null, null).category());
+        assertEquals("ACCOUNT", service.update(id(author), 126L, "제목", "본문", "ACCOUNT", false, null, null).category());
+    }
+
+    /** 「답변 받은 글」은 답변이 있는 글만 고르고, 결과에 공지를 붙이지 않는다 */
+    @Test
+    void 답변_받은_글은_답변_있는_글만_고르고_공지를_붙이지_않는다() {
+        when(postRepository.search(any(), anyBoolean(), anyBoolean(), anyBoolean(), anyBoolean(), anyBoolean(), any(), any(), any()))
+                .thenReturn(new PageImpl<>(List.of()));
+
+        service.list(id(author), 1, null, null, false, true);
+        verify(postRepository).search(eq(author.getId()), eq(false), eq(false), eq(false), eq(true), eq(false),
+                eq("TITLE_CONTENT"), eq("%"), any());
+        verify(noticeRepository, never()).findPinnedForBoard(any(), any());
+    }
+
+    // ── 이어 묻기 · 처리 상태 ───────────────────────────────────────
+
+    @Test
+    void 글쓴이는_자기_글에_이어_물을_수_있다() {
+        post(author, true);
+        BoardDto.Answer a = service.createFollowUp(id(author), 126L, new BoardDto.CreateFollowUp("12쪽도 그렇습니다"));
+        assertTrue(a.fromAuthor());
+        verify(answerRepository).save(argThat(x -> x.isFromAuthor() && x.getUserId().equals(author.getId())));
+    }
+
+    /** 남의 글에는 이어 쓸 수 없다 — 운영자도 이어 묻기가 아니라 답변으로 쓴다 */
+    @Test
+    void 남의_글에는_이어_물을_수_없다() {
+        post(author, false);
+        for (User u : List.of(other, admin)) {
+            CustomException e = assertThrows(CustomException.class,
+                    () -> service.createFollowUp(id(u), 126L, new BoardDto.CreateFollowUp("저도요")));
+            assertEquals(ErrorCode.COMMON_FORBIDDEN, e.getErrorCode());
+        }
+        verify(answerRepository, never()).save(any());
+    }
+
+    @Test
+    void 이어_묻는_글도_비면_400이다() {
+        post(author, false);
+        CustomException e = assertThrows(CustomException.class,
+                () -> service.createFollowUp(id(author), 126L, new BoardDto.CreateFollowUp(" ")));
+        assertEquals(ErrorCode.COMMON_BAD_REQUEST, e.getErrorCode());
+    }
+
+    /** 마지막 글이 운영자 답변이면 답변 완료, 그 뒤 글쓴이가 이어 물으면 다시 처리 중 */
+    @Test
+    void 처리_상태는_마지막_글로_정한다() {
+        post(author, false);
+        assertEquals("WAITING", service.getPost(id(author), 126L).status());
+
+        BoardAnswer reply = BoardAnswer.builder().postId(126L).userId(admin.getId()).content("반영했습니다").fromAuthor(false).build();
+        when(answerRepository.findByPostIdOrderByIdAsc(126L)).thenReturn(List.of(reply));
+        assertEquals("ANSWERED", service.getPost(id(author), 126L).status());
+
+        BoardAnswer followUp = BoardAnswer.builder().postId(126L).userId(author.getId()).content("또 깨집니다").fromAuthor(true).build();
+        when(answerRepository.findByPostIdOrderByIdAsc(126L)).thenReturn(List.of(reply, followUp));
+        BoardDto.PostDetail d = service.getPost(id(author), 126L);
+        assertEquals("WAITING", d.status());
+        assertTrue(d.answers().get(1).fromAuthor());
     }
 }

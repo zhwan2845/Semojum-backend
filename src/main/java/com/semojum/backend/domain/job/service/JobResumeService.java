@@ -50,7 +50,7 @@ public class JobResumeService {
         if (!pageRepository.existsByJob_IdAndBlockedReason(jobId, Page.BLOCKED_CREDIT_EXHAUSTED)) {
             throw new CustomException(ErrorCode.JOB_NOTHING_TO_RESUME);
         }
-        checkCreditAndReopen(jobId);
+        checkCreditAndReopen(userId, jobId);
 
         List<Page> targets = pageRepository.findByJobAndBlockedReasonOrderByPageNoAsc(job, Page.BLOCKED_CREDIT_EXHAUSTED);
         List<Integer> pageNos = requeue(job, targets);
@@ -73,7 +73,7 @@ public class JobResumeService {
         if (!pageRepository.existsByJobAndStatusAndBlockedReasonIsNull(job, "BLOCKED")) {
             throw new CustomException(ErrorCode.JOB_NOTHING_TO_RETRY);
         }
-        checkCreditAndReopen(jobId);
+        checkCreditAndReopen(userId, jobId);
 
         List<Page> targets = pageRepository.findByJobAndStatusAndBlockedReasonIsNullOrderByPageNoAsc(job, "BLOCKED");
         int stale = pageResultCleaner.deleteResultsOf(jobId, targets.stream().map(Page::getPageNo).toList());
@@ -92,12 +92,15 @@ public class JobResumeService {
         return job;
     }
 
-    private void checkCreditAndReopen(String jobId) {
+    private void checkCreditAndReopen(String userId, String jobId) {
         // 잔여가 모자라면 시작하지 않는다. 기준은 변환 관문과 같다 — 1 이상이면 보낸다. 무소속은 제한 없음
         UUID orgId = jobRepository.findOrganizationIdById(jobId);
         if (orgId != null && creditBalanceService.remaining(orgId) <= 0) {
             throw new CustomException(ErrorCode.CREDIT_INSUFFICIENT);
         }
+        // 계정 한도도 관문과 같다 — 이번 달 한도를 다 썼으면 기관 잔여가 있어도 시작하지 않는다
+        Long account = creditBalanceService.accountRemaining(UUID.fromString(userId));
+        if (account != null && account <= 0) throw new CustomException(ErrorCode.CREDIT_INSUFFICIENT);
         // 상태 전이가 곧 동시 요청 관문이다 — 두 번째 요청은 행 잠금을 기다렸다가 0 을 받는다
         if (jobRepository.reopenJob(jobId) == 0) throw new CustomException(ErrorCode.JOB_IN_PROGRESS);
     }

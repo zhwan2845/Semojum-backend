@@ -6,6 +6,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
+import java.util.List;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -18,17 +19,28 @@ class CreditGateTest {
 
     private final UUID orgA = UUID.randomUUID();
     private final UUID orgB = UUID.randomUUID();
+    private final UUID userA1 = UUID.randomUUID();
+    private final UUID userA2 = UUID.randomUUID();
     private CreditBalanceService balance;
+
+    private static List<Object[]> owner(UUID user, UUID org) {
+        List<Object[]> rows = new java.util.ArrayList<>();
+        rows.add(new Object[]{user, org});
+        return rows;
+    }
     private CreditGate gate;
 
     @BeforeEach
     void setUp() {
         balance = Mockito.mock(CreditBalanceService.class);
+        // 계정 한도 기본값 = 제한 없음(null). Mockito는 Long을 0으로 돌려줘 「한도 소진」이 된다
+        Mockito.lenient().when(balance.accountRemaining(org.mockito.ArgumentMatchers.any())).thenReturn(null);
         JobRepository jobs = Mockito.mock(JobRepository.class);
-        when(jobs.findOrganizationIdById("a1")).thenReturn(orgA);   // A기관 · 사람 1
-        when(jobs.findOrganizationIdById("a2")).thenReturn(orgA);   // A기관 · 사람 2
-        when(jobs.findOrganizationIdById("b1")).thenReturn(orgB);
-        when(jobs.findOrganizationIdById("free")).thenReturn(null); // 무소속(운영자)
+        when(jobs.findOwnerById("a1")).thenReturn(owner(userA1, orgA));   // A기관 · 사람 1
+        when(jobs.findOwnerById("a1b")).thenReturn(owner(userA1, orgA));  // A기관 · 사람 1의 다른 작업
+        when(jobs.findOwnerById("a2")).thenReturn(owner(userA2, orgA));   // A기관 · 사람 2
+        when(jobs.findOwnerById("b1")).thenReturn(owner(UUID.randomUUID(), orgB));
+        when(jobs.findOwnerById("free")).thenReturn(owner(UUID.randomUUID(), null)); // 무소속(운영자)
         gate = new CreditGate(balance, jobs);
     }
 
@@ -82,10 +94,43 @@ class CreditGateTest {
         assertTrue(gate.mayDispatch("a2"));
     }
 
+    /** 무소속 계정은 기관 잔여를 보지 않는다(계정 한도는 걸려 있으면 본다) */
     @Test
-    void 무소속_계정은_제한하지_않는다() {
+    void 무소속_계정은_기관_잔여로_제한하지_않는다() {
         assertTrue(gate.mayDispatch("free"));
         assertFalse(gate.exhausted("free"));
-        Mockito.verifyNoInteractions(balance);
+        Mockito.verify(balance, Mockito.never()).remaining(org.mockito.ArgumentMatchers.any());
+    }
+
+    // ── 계정 한도 ──────────────────────────────────────────────────
+
+    /** 기관 잔여가 넉넉해도 이번 달 계정 한도를 다 썼으면 막는다 */
+    @Test
+    void 계정_한도를_다_쓰면_기관_잔여가_있어도_막는다() {
+        when(balance.remaining(orgA)).thenReturn(5000L);
+        when(balance.accountRemaining(userA1)).thenReturn(0L);
+        assertTrue(gate.exhausted("a1"));
+        assertFalse(gate.exhausted("a2"), "같은 기관의 다른 계정은 한도와 무관하다");
+    }
+
+    /** 계정 잔여 10 미만이면 그 계정에서 한 쪽씩 — 다른 계정은 기다리지 않는다 */
+    @Test
+    void 계정_잔여_10_미만이면_그_계정에서만_한_쪽씩() {
+        when(balance.remaining(orgA)).thenReturn(5000L);
+        when(balance.accountRemaining(userA1)).thenReturn(4L);
+        gate.acquire("t1", "a1");
+        assertFalse(gate.mayDispatch("a1b"), "같은 계정의 다른 작업도 기다린다");
+        assertTrue(gate.mayDispatch("a2"));
+        gate.release("t1");
+        assertTrue(gate.mayDispatch("a1b"));
+    }
+
+    @Test
+    void 한도가_없으면_계정_잔여를_보지_않는다() {
+        when(balance.remaining(orgA)).thenReturn(5000L);
+        when(balance.accountRemaining(userA1)).thenReturn(null);
+        gate.acquire("t1", "a1");
+        assertTrue(gate.mayDispatch("a1b"));
+        assertFalse(gate.exhausted("a1"));
     }
 }

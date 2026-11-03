@@ -139,4 +139,22 @@ public class AdminSupportController {
         adminAccessGuard.check();
         return ApiResponse.success(adminSupportService.getOrderReceipt(orderId));
     }
+
+    // 견적서 파일 — 업로드(재업로드=교체) / 내려받기 presigned. 기관 관리자 주문 상세 「견적서 내려받기」
+    @PostMapping("/orders/{orderId}/quote")
+    public ApiResponse<SupportDto.OrderItem> uploadOrderQuote(
+            @PathVariable UUID orderId,
+            @RequestParam("file") MultipartFile file
+    ) {
+        adminAccessGuard.check();
+        return ApiResponse.success(adminSupportService.uploadOrderQuote(orderId, file));
+    }
+
+    @GetMapping("/orders/{orderId}/quote")
+    public ApiResponse<SupportDto.ReceiptDownload> getOrderQuote(
+            @PathVariable UUID orderId
+    ) {
+        adminAccessGuard.check();
+        return ApiResponse.success(adminSupportService.getOrderQuote(orderId));
+    }
 }

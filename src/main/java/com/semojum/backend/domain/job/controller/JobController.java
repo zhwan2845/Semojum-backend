@@ -57,8 +57,6 @@ public class JobController {
     public ApiResponse<JobResponseDto.Create> createJob(
             @AuthenticationPrincipal UserDetails userDetails,
             @RequestPart("file") List<MultipartFile> files,
-            // 선택 — 서버가 파일 종류로 정한다(PDF·HWP·HWPX·이미지=c, TXT=b). 구 클라이언트 호환으로 받기만 한다
-            @RequestParam(value = "mode", required = false) String mode,
             // 점자 판면 마지막 줄에 쪽번호를 넣을지 — 업로드 시 선택 (미전송 시 false)
             @RequestParam(value = "insertPageNumber", defaultValue = "false") boolean insertPageNumber,
             // 꼬리말(묵자, 최대 200자) — 서버는 보관만 하고 점역 · 배치는 앱이 한다. 미전송 시 없음
@@ -89,6 +87,8 @@ public class JobController {
             @RequestParam(value = "consecutiveSpace", required = false) String consecutiveSpace,
             @RequestParam(value = "lineBreakUnit", required = false) String lineBreakUnit,
             @RequestParam(value = "choiceLayout", required = false) String choiceLayout,
+            // 암호 PDF의 문서 암호 — JOB4018을 받은 앱이 암호 입력 창(Case 3)에서 받아 다시 올린다. 저장하지 않는다
+            @RequestParam(value = "password", required = false) String password,
             HttpServletRequest request
     ) throws Exception {
         LayoutOptions options = new LayoutOptions(cellsPerLine, linesPerPage, pageNumberLine, coverPages,
@@ -100,8 +100,8 @@ public class JobController {
                 new BrailleOptions(hangulGrade, englishGrade, brailleRule,
                         mixedRule, consecutiveSpace, lineBreakUnit, choiceLayout, null);
         return ApiResponse.success(
-                jobService.createJob(userDetails.getUsername(), files, mode, insertPageNumber, footerText,
-                        options, formId, brailleOptions, clientInfoResolver.resolve(request)));
+                jobService.createJob(userDetails.getUsername(), files, insertPageNumber, footerText,
+                        options, formId, brailleOptions, clientInfoResolver.resolve(request), password));
     }
 
     /**

@@ -7,6 +7,7 @@ import com.semojum.backend.domain.org.entity.Organization;
 import com.semojum.backend.domain.org.repository.OrganizationRepository;
 import com.semojum.backend.domain.support.dto.SupportDto;
 import com.semojum.backend.domain.support.entity.Inquiry;
+import com.semojum.backend.domain.support.entity.RequestDetails;
 import com.semojum.backend.domain.support.entity.Notice;
 import com.semojum.backend.domain.support.entity.Order;
 import com.semojum.backend.domain.support.repository.InquiryRepository;
@@ -100,6 +101,40 @@ class SupportServiceTest {
         assertEquals(ErrorCode.COMMON_BAD_REQUEST, e.getErrorCode());
     }
 
+    /** 피그마 계정 발급 요청 창 — 별칭 · 받을 사람 메일 · 쓸 수 있는 크레딧 */
+    @Test
+    void 계정_발급_요청은_창의_칸을_저장한다() {
+        var item = orgService.createRequest(orgAdmin.getId().toString(), new SupportDto.CreateRequest(
+                "ACCOUNT_ISSUE", null, " 국어 담당 ", "name@kblib.or.kr", "SHARED", 3000L, "ORG"));
+        assertEquals(new RequestDetails("국어 담당", "name@kblib.or.kr", "SHARED", null, null), item.details());
+    }
+
+    /** 피그마 크레딧 추가 요청 창 — 요청할 양 · 세금계산서. 다른 종류의 칸은 버린다 */
+    @Test
+    void 크레딧_추가_요청은_양과_세금계산서만_저장한다() {
+        var item = orgService.createRequest(orgAdmin.getId().toString(), new SupportDto.CreateRequest(
+                "CREDIT_ADD", null, "국어 담당", null, null, 3000L, "PERSONAL"));
+        assertEquals(new RequestDetails(null, null, null, 3000L, "PERSONAL"), item.details());
+    }
+
+    /** 칸을 모르는 구 앱 요청은 칸 없이(null) 저장한다 */
+    @Test
+    void 칸이_없는_요청은_details가_null이다() {
+        assertNull(orgService.createRequest(orgAdmin.getId().toString(),
+                new SupportDto.CreateRequest("CREDIT_ADD", "3,000 크레딧 추가 요청드립니다")).details());
+    }
+
+    @Test
+    void 요청_창의_허용값이_아니면_400이다() {
+        for (SupportDto.CreateRequest bad : List.of(
+                new SupportDto.CreateRequest("ACCOUNT_ISSUE", null, null, null, "ALL", null, null),
+                new SupportDto.CreateRequest("CREDIT_ADD", null, null, null, null, 10L, "COMPANY"))) {
+            CustomException e = assertThrows(CustomException.class,
+                    () -> orgService.createRequest(orgAdmin.getId().toString(), bad));
+            assertEquals(ErrorCode.COMMON_BAD_REQUEST, e.getErrorCode());
+        }
+    }
+
     @Test
     void 요청_취소는_자기_기관의_OPEN만() throws Exception {
         // 타 기관 요청 → 403
@@ -165,6 +200,41 @@ class SupportServiceTest {
 
         assertEquals("10월 정기 점검 안내", item.title());
         assertEquals(LocalDate.of(2026, 10, 9), n.getEndsOn());
+    }
+
+    /** 공지사항 창의 탭(점검 · 새 판 · 자료) — 등록한 분류가 공개 · 기관 · 콘솔 응답에 실린다 */
+    @Test
+    void 공지_분류를_저장하고_응답에_싣는다() {
+        when(noticeRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        SupportDto.NoticeItem item = adminService.createNotice(new SupportDto.CreateNotice(null, "10/15 서버 점검",
+                "본문", LocalDate.of(2026, 10, 1), LocalDate.of(2026, 10, 31), "MAINTENANCE"));
+        assertEquals("MAINTENANCE", item.category());
+
+        Notice n = Notice.builder().title("1.0.0 정식 판").body("본문").category("RELEASE")
+                .startsOn(LocalDate.of(2026, 10, 1)).endsOn(LocalDate.of(2026, 12, 31)).build();
+        when(noticeRepository.findVisibleForAll(any())).thenReturn(List.of(n));
+        assertEquals("RELEASE", orgService.getPublicNotices().get(0).category());
+    }
+
+    @Test
+    void 모르는_공지_분류는_400이다() {
+        CustomException e = assertThrows(CustomException.class, () -> adminService.createNotice(
+                new SupportDto.CreateNotice(null, "제목", "본문", LocalDate.of(2026, 10, 1), LocalDate.of(2026, 10, 2), "EVENT")));
+        assertEquals(ErrorCode.COMMON_BAD_REQUEST, e.getErrorCode());
+    }
+
+    /** 분류 칸이 없는 운영자 콘솔이 공지를 고쳐도 분류가 지워지지 않는다 */
+    @Test
+    void 공지_수정에서_분류를_안_보내면_그대로_둔다() throws Exception {
+        Notice n = Notice.builder().title("옛 제목").body("옛 본문").category("MATERIAL")
+                .startsOn(LocalDate.of(2026, 10, 1)).endsOn(LocalDate.of(2026, 10, 31)).build();
+        UUID id = UUID.randomUUID();
+        setId(n, id);
+        when(noticeRepository.findById(id)).thenReturn(Optional.of(n));
+
+        adminService.updateNotice(id, new SupportDto.CreateNotice(null, "새 제목", "새 본문",
+                LocalDate.of(2026, 10, 1), LocalDate.of(2026, 10, 31)));
+        assertEquals("MATERIAL", n.getCategory());
     }
 
     /** 고정 해제 — 게시판 맨 위에서 내려간다. 다시 고정할 수도 있다 */
@@ -242,6 +312,67 @@ class SupportServiceTest {
         CustomException e = assertThrows(CustomException.class,
                 () -> adminService.uploadOrderReceipt(order.getId(), file));
         assertEquals(ErrorCode.COMMON_BAD_REQUEST, e.getErrorCode());
+    }
+
+    // ── 주문 상세: 요청한 사람 · 견적서 ──
+
+    @Test
+    void 주문_내역에_요청한_사람과_요청한_날을_싣는다() throws Exception {
+        Inquiry request = Inquiry.builder().type(Inquiry.TYPE_CREDIT_ADD)
+                .organizationId(orgA.getId()).userId(orgAdmin.getId()).build();
+        setId(request, UUID.randomUUID());
+        java.time.Instant requestedAt = java.time.Instant.parse("2026-06-02T02:20:00Z");
+        org.springframework.test.util.ReflectionTestUtils.setField(request, "createdAt", requestedAt);
+        Order linked = Order.builder().organizationId(orgA.getId()).orderDate(LocalDate.now())
+                .description("크레딧 추가 · 3,000").amountKrw(780_000).creditAmount(3000L).requestId(request.getId()).build();
+        Order plain = Order.builder().organizationId(orgA.getId()).orderDate(LocalDate.now())
+                .description("연간 계약").amountKrw(1000).build();
+        Mockito.when(orderRepository.findByOrganizationIdOrderByOrderDateDesc(orgA.getId())).thenReturn(List.of(linked, plain));
+        Mockito.when(inquiryRepository.findAllById(List.of(request.getId()))).thenReturn(List.of(request));
+        Mockito.when(userRepository.findAllById(List.of(orgAdmin.getId()))).thenReturn(List.of(orgAdmin));
+
+        var items = orgService.getOrders(orgAdmin.getId().toString()).items();
+        assertEquals("orga01", items.get(0).requestedBy());
+        assertEquals("ROLE_ORG_ADMIN", items.get(0).requestedByRole());
+        assertEquals(requestedAt, items.get(0).requestedAt());
+        assertNull(items.get(1).requestedBy());
+    }
+
+    /** 주문에 잇는 요청은 같은 기관의 크레딧 추가 요청만 — 남의 기관 요청을 이으면 요청자가 새어 나간다 */
+    @Test
+    void 주문에는_같은_기관의_크레딧_추가_요청만_잇는다() throws Exception {
+        Mockito.when(organizationRepository.findById(orgA.getId())).thenReturn(Optional.of(orgA));
+        Inquiry otherOrg = Inquiry.builder().type(Inquiry.TYPE_CREDIT_ADD).organizationId(orgB.getId()).build();
+        Inquiry accountIssue = Inquiry.builder().type(Inquiry.TYPE_ACCOUNT_ISSUE).organizationId(orgA.getId()).build();
+        for (Inquiry bad : List.of(otherOrg, accountIssue)) {
+            UUID id = UUID.randomUUID();
+            setId(bad, id);
+            Mockito.when(inquiryRepository.findById(id)).thenReturn(Optional.of(bad));
+            CustomException e = assertThrows(CustomException.class, () -> adminService.createOrder(
+                    new SupportDto.CreateOrder(orgA.getId(), LocalDate.now(), "크레딧 추가", 780_000L, 3000L, id)));
+            assertEquals(ErrorCode.COMMON_BAD_REQUEST, e.getErrorCode());
+        }
+        Mockito.verify(orderRepository, Mockito.never()).save(Mockito.any());
+    }
+
+    @Test
+    void 견적서는_증빙과_다른_자리에_올리고_자기_기관만_내려받는다() throws Exception {
+        Order order = receiptOrder(orgA);
+        Mockito.when(organizationRepository.findById(orgA.getId())).thenReturn(Optional.of(orgA));
+        SupportDto.OrderItem item = adminService.uploadOrderQuote(order.getId(),
+                new MockMultipartFile("file", "견적서.pdf", "application/pdf", new byte[]{1}));
+        assertEquals("견적서.pdf", item.quoteFileName());
+        Mockito.verify(s3Service).uploadFile(Mockito.eq("quotes/" + order.getId() + "/quote.pdf"),
+                Mockito.any(), Mockito.eq("application/pdf"));
+        Mockito.verify(s3Service, Mockito.never()).deleteByPrefix("receipts/" + order.getId() + "/");
+
+        Mockito.when(s3Service.getPresignedUrl(Mockito.anyString(), Mockito.any())).thenReturn("https://signed");
+        assertEquals("견적서.pdf", orgService.getOrderQuote(orgAdmin.getId().toString(), order.getId()).fileName());
+
+        Order others = receiptOrder(orgB);
+        CustomException e = assertThrows(CustomException.class,
+                () -> orgService.getOrderQuote(orgAdmin.getId().toString(), others.getId()));
+        assertEquals(ErrorCode.COMMON_FORBIDDEN, e.getErrorCode());
     }
 
     @Test

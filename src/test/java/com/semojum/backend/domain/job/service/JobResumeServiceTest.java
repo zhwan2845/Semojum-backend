@@ -80,6 +80,8 @@ class JobResumeServiceTest {
         jobRepository = Mockito.mock(JobRepository.class);
         pageRepository = Mockito.mock(PageRepository.class);
         creditBalanceService = Mockito.mock(CreditBalanceService.class);
+        // 계정 한도 기본값 = 제한 없음(null). Mockito는 Long을 0으로 돌려줘 「한도 소진」이 된다
+        Mockito.lenient().when(creditBalanceService.accountRemaining(org.mockito.ArgumentMatchers.any())).thenReturn(null);
         JobDispatcher dispatcher = new JobDispatcher(redisTemplate, jobRepository, new ObjectMapper(),
                 Mockito.mock(CreditGate.class));
         pageResultCleaner = Mockito.mock(PageResultCleaner.class);
@@ -181,6 +183,18 @@ class JobResumeServiceTest {
         when(creditBalanceService.remaining(ORG_ID)).thenReturn(1L);
 
         assertEquals(List.of(2), service.resume(USER_ID.toString(), JOB).resumedPages());
+    }
+
+    /** 이번 달 계정 한도를 다 썼으면 기관 잔여가 있어도 시작하지 않는다 — 변환 관문과 같은 기준 */
+    @Test
+    void 계정_한도를_다_썼으면_시작하지_않는다() {
+        givenFinishedJob(false, "COMPLETED", "CREDIT");
+        when(creditBalanceService.remaining(ORG_ID)).thenReturn(5000L);
+        when(creditBalanceService.accountRemaining(USER_ID)).thenReturn(0L);
+
+        CustomException e = assertThrows(CustomException.class, () -> service.resume(USER_ID.toString(), JOB));
+        assertEquals(ErrorCode.CREDIT_INSUFFICIENT, e.getErrorCode());
+        verify(jobRepository, never()).reopenJob(any());
     }
 
     @Test

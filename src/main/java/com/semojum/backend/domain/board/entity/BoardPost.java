@@ -34,6 +34,10 @@ public class BoardPost {
     @Column(nullable = false, columnDefinition = "text")
     private String content;
 
+    // 분류 — {@link com.semojum.backend.global.category.QuestionCategory}. 분류가 생기기 전에 쓴 글은 null
+    @Column(length = 20)
+    private String category;
+
     // 비밀글 — 목록엔 제목이 보이고 열람은 작성자·운영자만
     @Column(nullable = false)
     private boolean secret;
@@ -54,18 +58,20 @@ public class BoardPost {
     private LocalDateTime updatedAt;
 
     @Builder
-    public BoardPost(UUID userId, String title, String content, boolean secret) {
+    public BoardPost(UUID userId, String title, String content, String category, boolean secret) {
         this.userId = userId;
         this.title = title;
         this.content = content;
+        this.category = category;
         this.secret = secret;
         this.createdAt = LocalDateTime.now();
         this.updatedAt = this.createdAt;
     }
 
-    public void update(String title, String content, boolean secret) {
+    public void update(String title, String content, String category, boolean secret) {
         this.title = title;
         this.content = content;
+        this.category = category;
         this.secret = secret;
         this.updatedAt = LocalDateTime.now();
     }

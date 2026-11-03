@@ -23,6 +23,10 @@ permissions:
 env:
   AWS_REGION: ap-northeast-2
   DEPLOY_ROLE_ARN: ${{ secrets.DEPLOY_ROLE_ARN }}
+  # 배포 대상 EC2 — SSM으로 붙는다(22번 인바운드가 없다). 주소 · 인스턴스 · 호스트 키는 저장소 Secrets에서 받는다
+  INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+  VM_ADDRESS: ${{ secrets.VM_HOST }}
+  VM_HOST_KEY: ${{ secrets.VM_HOST_KEY }}
 
 jobs:
   deploy:
@@ -58,7 +62,7 @@ jobs:
       - name: Build JAR
         run: ./gradlew bootJar -x test
 
-      # OIDC 로 배포 역할을 맡는다 — ECR 푸시와 22번 임시 개방 권한만 있다
+      # OIDC 로 배포 역할을 맡는다 — ECR 푸시와 이 EC2로의 SSM 접속 권한만 있다
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -78,42 +82,31 @@ jobs:
           push: true
           tags: ${{ steps.ecr.outputs.registry }}/semojum-backend:${{ github.sha }}
 
-      # EC2의 22번 포트를 상시 개방하지 않기 위해, 배포 동안만 러너 IP를 허용한다.
-
-      - name: Open SSH for runner IP
-        id: open-ssh
+      # SSH는 SSM Session Manager를 거친다(2026-11-02) — EC2에 22번 인바운드가 없다.
+      # 예전엔 배포 동안 러너 IP로 22번을 열고 닫았다(보안그룹 수정 권한이 필요했고, 회수가 실패하면 구멍이 남았다)
+      - name: Set up SSH over SSM
         run: |
-          RUNNER_IP=$(curl -s https://checkip.amazonaws.com)
-          echo "runner_ip=$RUNNER_IP" >> "$GITHUB_OUTPUT"
-          aws ec2 authorize-security-group-ingress \
-            --group-id ${{ secrets.EC2_SECURITY_GROUP_ID }} \
-            --protocol tcp --port 22 --cidr "$RUNNER_IP/32"
+          curl -fsSL -o /tmp/ssm-plugin.deb https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb
+          sudo dpkg -i /tmp/ssm-plugin.deb
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          echo "$VM_HOST_KEY" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host vm
+            HostName $VM_ADDRESS
+            User ${{ secrets.VM_USER }}
+            IdentityFile ~/.ssh/deploy_key
+            StrictHostKeyChecking yes
+            ServerAliveInterval 30
+            ProxyCommand aws ssm start-session --region $AWS_REGION --target $INSTANCE_ID --document-name AWS-StartSSHSession --parameters portNumber=%p
+          EOF
 
       - name: Copy deploy files to VM
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.VM_HOST }}
-          username: ${{ secrets.VM_USER }}
-          key: ${{ secrets.VM_SSH_KEY }}
-          source: "docker-compose.yml,envoy.yaml,scripts/deploy.sh"
-          target: "/home/ubuntu/semojum/"
+        run: scp docker-compose.yml envoy.yaml vm:/home/ubuntu/semojum/ && scp scripts/deploy.sh vm:/home/ubuntu/semojum/scripts/deploy.sh
 
       # 블루그린 무중단 배포: 새 이미지를 비활성 색으로 띄우고 헬스 통과 후 구 색을 내린다.
       # 새 버전이 안 뜨면 deploy.sh가 실패(exit 1)하고 구버전이 계속 서비스한다(배포 게이트).
       - name: Deploy via SSH (blue-green)
-        uses: appleboy/ssh-action@v1.0.0
-        with:
-          host: ${{ secrets.VM_HOST }}
-          username: ${{ secrets.VM_USER }}
-          key: ${{ secrets.VM_SSH_KEY }}
-          command_timeout: 10m
-          # 방금 올린 이미지를 정확히 지정해 띄운다(이미지 주소는 비밀이 아니다)
-          script: BACKEND_IMAGE=${{ steps.ecr.outputs.registry }}/semojum-backend:${{ github.sha }} bash /home/ubuntu/semojum/scripts/deploy.sh
-
-      # 배포 성공·실패와 무관하게 반드시 회수 (규칙이 남아 포트가 열린 채 방치되지 않도록)
-      - name: Close SSH for runner IP
-        if: always() && steps.open-ssh.outputs.runner_ip != ''
-        run: |
-          aws ec2 revoke-security-group-ingress \
-            --group-id ${{ secrets.EC2_SECURITY_GROUP_ID }} \
-            --protocol tcp --port 22 --cidr "${{ steps.open-ssh.outputs.runner_ip }}/32"
+        timeout-minutes: 10
+        # 방금 올린 이미지를 정확히 지정해 띄운다(이미지 주소는 비밀이 아니다)
+        run: ssh vm "BACKEND_IMAGE=${{ steps.ecr.outputs.registry }}/semojum-backend:${{ github.sha }} bash /home/ubuntu/semojum/scripts/deploy.sh"

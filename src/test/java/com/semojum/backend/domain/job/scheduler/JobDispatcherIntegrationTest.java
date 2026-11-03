@@ -160,11 +160,13 @@ class JobDispatcherIntegrationTest {
     void 잔여_크레딧이_적은_기관은_기관_전체에서_한_쪽씩_나간다() {
         UUID low = UUID.randomUUID(), rich = UUID.randomUUID();
         var balance = Mockito.mock(CreditBalanceService.class);
+        // 계정 한도 기본값 = 제한 없음(null). Mockito는 Long을 0으로 돌려줘 「한도 소진」이 된다
+        Mockito.lenient().when(balance.accountRemaining(org.mockito.ArgumentMatchers.any())).thenReturn(null);
         when(balance.remaining(low)).thenReturn(5L);
         when(balance.remaining(rich)).thenReturn(1000L);
-        when(jobRepository.findOrganizationIdById("a1")).thenReturn(low);
-        when(jobRepository.findOrganizationIdById("a2")).thenReturn(low);
-        when(jobRepository.findOrganizationIdById("r1")).thenReturn(rich);
+        when(jobRepository.findOwnerById("a1")).thenReturn(owner(UUID.randomUUID(), low));
+        when(jobRepository.findOwnerById("a2")).thenReturn(owner(UUID.randomUUID(), low));
+        when(jobRepository.findOwnerById("r1")).thenReturn(owner(UUID.randomUUID(), rich));
         CreditGate gate = new CreditGate(balance, jobRepository);
         dispatcher = new JobDispatcher(redisTemplate, jobRepository, new ObjectMapper(), gate);
 
@@ -186,5 +188,11 @@ class JobDispatcherIntegrationTest {
         String next = dispatcher.poll();
         assertNotNull(next);
         assertNull(dispatcher.poll(), "다시 한 쪽이 들어가 있으니 그다음은 기다린다");
+    }
+
+    private static List<Object[]> owner(UUID user, UUID org) {
+        List<Object[]> rows = new ArrayList<>();
+        rows.add(new Object[]{user, org});
+        return rows;
     }
 }

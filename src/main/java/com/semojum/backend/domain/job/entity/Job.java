@@ -40,7 +40,6 @@ public class Job {
 
     private String originalFilePath;
     private String originalFileName;
-    private String thumbnailUrl;
 
     @Column(nullable = false)
     private LocalDateTime startedAt;
@@ -102,7 +101,7 @@ public class Job {
     @Column(name = "braille_options", columnDefinition = "jsonb")
     private BrailleOptions brailleOptions;
 
-    // 접속 메타데이터 (운영자 작업 상세 「요청 정보」) — 생성 시 1회 기록. 위치는 표시 시점에 IP로 GeoIP 조회
+    // 접속 메타데이터 (운영자 작업 상세 「요청 정보」) — 생성 시 1회 기록
     @Column(name = "client_ip", length = 45)
     private String clientIp;
 
@@ -122,7 +121,7 @@ public class Job {
 
     @Builder
     public Job(String id, User user, String mode, int totalPages, String originalFileName,
-               String thumbnailUrl, boolean insertPageNumber, String footerText, boolean adminCopy,
+               boolean insertPageNumber, String footerText, boolean adminCopy,
                LayoutOptions layoutOptions,
                BrailleOptions brailleOptions) {
         this.id = id;
@@ -130,7 +129,6 @@ public class Job {
         this.mode = mode;
         this.totalPages = totalPages;
         this.originalFileName = originalFileName;
-        this.thumbnailUrl = thumbnailUrl;
         this.insertPageNumber = insertPageNumber;
         this.footerText = footerText;
         this.layoutOptions = layoutOptions;
@@ -216,10 +214,6 @@ public class Job {
     public void markCanceled(int originalTotalPages) {
         this.canceledAt = LocalDateTime.now();
         this.originalTotalPages = originalTotalPages;
-    }
-
-    public void updateThumbnailUrl(String thumbnailUrl) {
-        this.thumbnailUrl = thumbnailUrl;
     }
 
     /**

@@ -41,6 +41,7 @@ class LoginLockTest {
     PasswordEncoder passwordEncoder;
     AuthService authService;
     JwtProvider jwt;
+    UserSessionRepository sessions;
     User user;
 
     @BeforeEach
@@ -61,7 +62,8 @@ class LoginLockTest {
         userRepository = mock(UserRepository.class);
         passwordEncoder = mock(PasswordEncoder.class);
         jwt = mock(JwtProvider.class);
-        authService = new AuthService(userRepository, mock(UserSessionRepository.class), jwt,
+        sessions = mock(UserSessionRepository.class);
+        authService = new AuthService(userRepository, sessions, jwt,
                 passwordEncoder, mock(ConsoleOrigins.class), attempts);
 
         user = User.builder().loginId("testorg01").password("hash").build();
@@ -85,6 +87,19 @@ class LoginLockTest {
         assertEquals(4, remaining(login("testorg01", "wrong")));
         assertEquals(3, remaining(login("testorg01", "wrong")));
         assertEquals(2, remaining(login("testorg01", "wrong")));   // 화면 「남은 횟수 2회입니다」
+    }
+
+    /** 앱이 안내 문구를 상수로 들고 있지 않게 정책값을 함께 싣는다 */
+    @Test
+    void 실패와_잠금_응답에_한도와_잠금_시간을_싣는다() {
+        LoginAttemptService.Failure failure = (LoginAttemptService.Failure) login("testorg01", "wrong").getResult();
+        assertEquals(5, failure.maxAttempts());
+        assertEquals(10, failure.lockMinutes());
+
+        for (int i = 0; i < 3; i++) login("testorg01", "wrong");
+        LoginAttemptService.Locked locked = (LoginAttemptService.Locked) login("testorg01", "wrong").getResult();
+        assertEquals(5, locked.maxAttempts());
+        assertEquals(10, locked.lockMinutes());
     }
 
     @Test
@@ -145,7 +160,7 @@ class LoginLockTest {
     void 로그인_응답에_별칭이_실린다() {
         user.changeAlias("김점역");
         when(jwt.generateAccessToken(anyString())).thenReturn("a");
-        when(jwt.generateRefreshToken(anyString())).thenReturn("r");
+        when(jwt.generateRefreshToken(anyString(), anyLong())).thenReturn("r");
         when(jwt.hashToken(anyString())).thenReturn("h");
 
         assertEquals("김점역", authService.login(new AuthRequestDto.Login("testorg01", "right"), null).alias());
@@ -161,5 +176,23 @@ class LoginLockTest {
         for (int i = 0; i < 4; i++) login("testorg01", "wrong");
 
         assertEquals(4, remaining(login("testorg02", "wrong")));
+    }
+
+    /** 피그마 로그인 창 「로그인 상태 유지」 — 켜면 리프레시 토큰과 세션이 30일, 안 켜면 기본 12시간 */
+    @Test
+    void 로그인_상태_유지를_켜면_세션이_길다() {
+        ReflectionTestUtils.setField(authService, "keepLoginRefreshExpiry", 2_592_000_000L);
+        when(jwt.getRefreshTokenExpiry()).thenReturn(43_200_000L);
+        when(jwt.generateAccessToken(anyString())).thenReturn("a");
+        when(jwt.generateRefreshToken(anyString(), anyLong())).thenReturn("r");
+        when(jwt.hashToken(anyString())).thenReturn("h");
+
+        authService.login(new AuthRequestDto.Login("testorg01", "right", true), null);
+        verify(jwt).generateRefreshToken(anyString(), eq(2_592_000_000L));
+        verify(sessions).save(argThat(se -> se.getExpiresAt().isAfter(LocalDateTime.now().plusDays(29))));
+
+        authService.login(new AuthRequestDto.Login("testorg01", "right"), null);
+        verify(jwt).generateRefreshToken(anyString(), eq(43_200_000L));
+        verify(sessions).save(argThat(se -> se.getExpiresAt().isBefore(LocalDateTime.now().plusHours(13))));
     }
 }

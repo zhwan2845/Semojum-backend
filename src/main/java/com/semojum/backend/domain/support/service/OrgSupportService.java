@@ -6,6 +6,7 @@ import com.semojum.backend.domain.auth.repository.UserRepository;
 import com.semojum.backend.domain.org.entity.Organization;
 import com.semojum.backend.domain.support.dto.SupportDto;
 import com.semojum.backend.domain.support.entity.Inquiry;
+import com.semojum.backend.domain.support.entity.RequestDetails;
 import com.semojum.backend.domain.support.repository.InquiryRepository;
 import com.semojum.backend.domain.support.repository.NoticeRepository;
 import com.semojum.backend.domain.support.entity.Order;
@@ -22,6 +23,9 @@ import java.time.ZoneId;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
+import java.util.Objects;
+import java.util.Map;
 import com.semojum.backend.global.s3.S3Service;
 import java.time.Duration;
 
@@ -36,6 +40,8 @@ public class OrgSupportService {
 
     private static final ZoneId KST = ZoneId.of("Asia/Seoul");
     private static final Set<String> REQUEST_TYPES = Set.of(Inquiry.TYPE_CREDIT_ADD, Inquiry.TYPE_ACCOUNT_ISSUE, Inquiry.TYPE_ERROR_REPORT);
+    private static final Set<String> CREDIT_SCOPES = Set.of("SHARED", "NONE");
+    private static final Set<String> INVOICE_TYPES = Set.of("ORG", "PERSONAL", "NONE");
 
     private final UserRepository userRepository;
     private final NoticeRepository noticeRepository;
@@ -48,7 +54,7 @@ public class OrgSupportService {
     public List<SupportDto.PublicNotice> getPublicNotices() {
         return noticeRepository.findVisibleForAll(LocalDate.now(KST)).stream()
                 .map(n -> new SupportDto.PublicNotice(n.getId(), n.getTitle(), n.getBody(),
-                        n.getStartsOn(), n.getEndsOn(), n.getCreatedAt()))
+                        n.getStartsOn(), n.getEndsOn(), n.getCreatedAt(), n.getCategory()))
                 .toList();
     }
 
@@ -58,19 +64,35 @@ public class OrgSupportService {
         return noticeRepository.findVisibleForOrganization(org.getId(), LocalDate.now(KST)).stream()
                 .map(n -> new SupportDto.OrgNotice(n.getId(),
                         n.getTargetOrganizationId() == null ? "ALL" : "ORG",
-                        n.getTitle(), n.getBody(), n.getStartsOn(), n.getEndsOn(), n.getCreatedAt()))
+                        n.getTitle(), n.getBody(), n.getStartsOn(), n.getEndsOn(), n.getCreatedAt(),
+                        n.getCategory()))
                 .toList();
     }
 
     @Transactional(readOnly = true)
     public SupportDto.OrgOrders getOrders(String adminUserId) {
         Organization org = resolveOrgAdmin(adminUserId).getOrganization();
-        List<SupportDto.OrgOrderItem> items = orderRepository
-                .findByOrganizationIdOrderByOrderDateDesc(org.getId()).stream()
-                .map(o -> new SupportDto.OrgOrderItem(o.getId(), o.getOrderDate(), o.getDescription(),
-                        o.getAmountKrw(), o.getCreditAmount(), o.getPaidAt(), o.getInvoiceStatus(),
-                        o.getReceiptFileName()))
-                .toList();
+        List<Order> orders = orderRepository.findByOrganizationIdOrderByOrderDateDesc(org.getId());
+
+        // 요청한 사람 — 주문마다 조회하지 않고 요청 · 사용자를 한 번에 읽는다
+        Map<UUID, Inquiry> requests = inquiryRepository.findAllById(orders.stream()
+                        .map(Order::getRequestId).filter(Objects::nonNull).distinct().toList()).stream()
+                .collect(Collectors.toMap(Inquiry::getId, i -> i));
+        Map<UUID, User> requesters = userRepository.findAllById(requests.values().stream()
+                        .map(Inquiry::getUserId).filter(Objects::nonNull).distinct().toList()).stream()
+                .collect(Collectors.toMap(User::getId, u -> u));
+
+        List<SupportDto.OrgOrderItem> items = orders.stream().map(o -> {
+            Inquiry request = o.getRequestId() == null ? null : requests.get(o.getRequestId());
+            User requester = request == null || request.getUserId() == null ? null : requesters.get(request.getUserId());
+            return new SupportDto.OrgOrderItem(o.getId(), o.getOrderDate(), o.getDescription(),
+                    o.getAmountKrw(), o.getCreditAmount(), o.getPaidAt(), o.getInvoiceStatus(),
+                    o.getReceiptFileName(),
+                    requester == null ? null : requester.getLoginId(),
+                    requester == null ? null : requester.getRole().name(),
+                    request == null ? null : request.getCreatedAt(),
+                    o.getQuoteFileName());
+        }).toList();
         return new SupportDto.OrgOrders(org.getReceiptEmail(), items);
     }
 
@@ -89,6 +111,21 @@ public class OrgSupportService {
         }
         return new SupportDto.ReceiptDownload(order.getReceiptFileName(),
                 s3Service.getPresignedUrl(order.getReceiptFileKey(), Duration.ofMinutes(15)));
+    }
+
+    /** 견적서 내려받기 — 자기 기관 주문만, presigned 15분 */
+    @Transactional(readOnly = true)
+    public SupportDto.ReceiptDownload getOrderQuote(String adminUserId, UUID orderId) {
+        Organization org = resolveOrgAdmin(adminUserId).getOrganization();
+        Order order = orderRepository.findById(orderId)
+                .orElseThrow(() -> new CustomException(ErrorCode.COMMON_NOT_FOUND));
+        if (!order.getOrganizationId().equals(org.getId())) {
+            log.warn("타 기관 견적서 접근 거부: org={}, order={}", org.getCode(), orderId);
+            throw new CustomException(ErrorCode.COMMON_FORBIDDEN);
+        }
+        if (order.getQuoteFileKey() == null) throw new CustomException(ErrorCode.COMMON_NOT_FOUND);
+        return new SupportDto.ReceiptDownload(order.getQuoteFileName(),
+                s3Service.getPresignedUrl(order.getQuoteFileKey(), Duration.ofMinutes(15)));
     }
 
     @Transactional
@@ -111,12 +148,13 @@ public class OrgSupportService {
                 .organizationId(admin.getOrganization().getId())
                 .userId(admin.getId())
                 .message(request.message())
+                .requestDetails(requestDetails(request))
                 .build());
         log.info("기관 요청 접수: org={}, by={}, type={}, id={}",
                 admin.getOrganization().getCode(), admin.getLoginId(), request.type(), saved.getId());
         Inquiry loaded = inquiryRepository.findById(saved.getId()).orElse(saved);
         return new SupportDto.RequestItem(loaded.getId(), loaded.getType(), loaded.getStatus(),
-                loaded.getMessage(), loaded.getCreatedAt());
+                loaded.getMessage(), loaded.getCreatedAt(), loaded.getRequestDetails());
     }
 
     @Transactional(readOnly = true)
@@ -124,7 +162,7 @@ public class OrgSupportService {
         Organization org = resolveOrgAdmin(adminUserId).getOrganization();
         return inquiryRepository.findByOrganizationIdOrderByCreatedAtDesc(org.getId()).stream()
                 .map(i -> new SupportDto.RequestItem(i.getId(), i.getType(), i.getStatus(),
-                        i.getMessage(), i.getCreatedAt()))
+                        i.getMessage(), i.getCreatedAt(), i.getRequestDetails()))
                 .toList();
     }
 
@@ -145,6 +183,30 @@ public class OrgSupportService {
         }
         inquiryRepository.delete(inquiry);
         log.info("기관 요청 취소: org={}, id={}", org.getCode(), requestId);
+    }
+
+    /**
+     * 요청 창의 칸 — 그 요청 종류의 칸만 남긴다(다른 종류 칸을 보내도 저장하지 않는다). 칸이 하나도 없으면 null.
+     * 허용값이 아니면 400.
+     */
+    private static RequestDetails requestDetails(SupportDto.CreateRequest r) {
+        if (r.creditScope() != null && !CREDIT_SCOPES.contains(r.creditScope())) {
+            throw new CustomException(ErrorCode.COMMON_BAD_REQUEST);
+        }
+        if (r.invoiceType() != null && !INVOICE_TYPES.contains(r.invoiceType())) {
+            throw new CustomException(ErrorCode.COMMON_BAD_REQUEST);
+        }
+        RequestDetails details = switch (r.type()) {
+            case Inquiry.TYPE_ACCOUNT_ISSUE -> new RequestDetails(trimToNull(r.accountAlias()),
+                    trimToNull(r.recipientEmail()), r.creditScope(), null, null);
+            case Inquiry.TYPE_CREDIT_ADD -> new RequestDetails(null, null, null, r.creditAmount(), r.invoiceType());
+            default -> null;
+        };
+        return details == null || details.equals(new RequestDetails(null, null, null, null, null)) ? null : details;
+    }
+
+    private static String trimToNull(String s) {
+        return s == null || s.isBlank() ? null : s.trim();
     }
 
     // 기관 소속 확인만 (역할 무관) — 요청 접수용

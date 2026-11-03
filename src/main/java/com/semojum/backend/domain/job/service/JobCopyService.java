@@ -27,7 +27,7 @@ import java.util.*;
  * <ul>
  *   <li><b>전부 복사</b> — 쪽 · 쪽 결과 · 텍스트/점자 블록(원본 · 현재) · 대체 초안 · bbox · 규정 · 품질 · 메모 · 답글.
  *       받은 사람도 원본 패널과 규정 보기를 그대로 쓴다</li>
- *   <li><b>S3 파일은 복사하지 않고 같은 객체를 가리킨다</b> — 쪽 PDF · 미리보기 · 썸네일은 만든 뒤 바뀌지 않고,
+ *   <li><b>S3 파일은 복사하지 않고 같은 객체를 가리킨다</b> — 쪽 PDF · 미리보기는 만든 뒤 바뀌지 않고,
  *       작업 삭제 경로가 없어 원본이 먼저 사라질 일이 없다. 205쪽이면 복사만 400번이다</li>
  *   <li><b>파일이 있는 누구나</b> 만들 수 있다(기관 제한 없음) — 작업 ID를 아는 것 = 파일을 가진 것</li>
  *   <li>변환이 아니다 — 크레딧 차감 없음, 원가 0, {@code admin_copy=true}로 통계 · 사용량에서 빠진다</li>
@@ -64,7 +64,6 @@ public class JobCopyService {
                 .mode(source.getMode())
                 .totalPages(source.getTotalPages())
                 .originalFileName(source.getOriginalFileName())
-                .thumbnailUrl(source.getThumbnailUrl())
                 .insertPageNumber(source.isInsertPageNumber())
                 .footerText(source.getFooterText())
                 .layoutOptions(source.getLayoutOptions())
@@ -132,6 +131,8 @@ public class JobCopyService {
                     .subtypeConfidence(el.getSubtypeConfidence())
                     .contents(el.getOriginalContents())   // AI 원본 보존
                     .drafts(el.getDrafts()).isBlocked(el.isBlocked())
+                    .reviewFlag(el.getReviewFlag()).tableSource(el.getTableSource())
+                    .tableBoxLevel(el.getTableBoxLevel())
                     .build();
             n.updateCurrentContents(el.getCurrentContents());   // 편집본 보존
             textElementRepository.save(n);
@@ -163,7 +164,7 @@ public class JobCopyService {
                         .section(rt.getSection()).title(rt.getTitle()).excerpt(rt.getExcerpt())
                         .lineNo(rt.getLineNo()).colStart(rt.getColStart()).colEnd(rt.getColEnd())
                         .tag(rt.getTag()).publisher(rt.getPublisher()).version(rt.getVersion())
-                        .sectionPath(rt.getSectionPath())
+                        .sectionPath(rt.getSectionPath()).axis(rt.getAxis())
                         .build());
             }
         }

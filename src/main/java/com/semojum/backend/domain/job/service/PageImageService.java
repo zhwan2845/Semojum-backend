@@ -17,7 +17,7 @@ import org.springframework.transaction.annotation.Transactional;
  * WASM으로 소프트웨어 디코딩된다). 서버가 미리 구운 JPEG를 {@code <img>}로 그리면 6~9ms다.
  *
  * <p><b>실패는 삼킨다</b>: 이미지가 없으면 조회 API가 원본 PDF로 폴백하므로(느릴 뿐 화면은 나온다)
- * 렌더 실패가 변환 자체를 막지 않는다 — 썸네일과 같은 원칙.
+ * 렌더 실패가 변환 자체를 막지 않는다.
  */
 @Slf4j
 @Service

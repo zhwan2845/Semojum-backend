@@ -73,8 +73,7 @@ class JobCopyServiceTest {
         owner = withId(User.builder().loginId("testorg01").password("pw").build(), UUID.randomUUID());
         receiver = withId(User.builder().loginId("testorg02").password("pw").build(), UUID.randomUUID());
 
-        source = Job.builder().id("job_src").user(owner).mode("c").totalPages(1).originalFileName("교재.pdf")
-                .thumbnailUrl("https://b/job_src/thumbnail.png").footerText("수특").build();
+        source = Job.builder().id("job_src").user(owner).mode("c").totalPages(1).originalFileName("교재.pdf").footerText("수특").build();
         source.complete(new int[]{});
         srcPage = withId(Page.builder().job(source).pageNo(1).pdfPath("s3://b/job_src/pages/page-1.pdf").build(), UUID.randomUUID());
         srcPage.updateImagePath("s3://b/job_src/pages/page-1.jpg");
@@ -103,7 +102,6 @@ class JobCopyServiceTest {
         assertSame(receiver, copy.getUser());
         assertTrue(copy.isAdminCopy(), "변환이 아니다 — 통계 · 원가 · 사용량에서 뺀다");
         assertEquals("수특", copy.getFooterText());
-        assertEquals("https://b/job_src/thumbnail.png", copy.getThumbnailUrl(), "썸네일도 같은 객체");
         verify(jobRepo).finishJob(eq(copy.getId()), eq("COMPLETED"), eq("{}"));
     }
 

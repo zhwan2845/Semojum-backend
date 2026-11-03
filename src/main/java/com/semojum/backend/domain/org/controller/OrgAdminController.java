@@ -29,12 +29,32 @@ public class OrgAdminController {
         return ApiResponse.success(orgAdminService.getDashboard(userDetails.getUsername()));
     }
 
+    /** 크레딧 추가 요청 창의 예상 금액 — 요청할 양 × 단가(부가세 포함, 임시 단가 260원) */
+    @GetMapping("/credit-estimate")
+    public ApiResponse<OrgDto.CreditEstimate> getCreditEstimate(
+            @AuthenticationPrincipal UserDetails userDetails,
+            @RequestParam long credits
+    ) {
+        return ApiResponse.success(orgAdminService.getCreditEstimate(userDetails.getUsername(), credits));
+    }
+
     /** 소속 계정 목록 — 별칭·상태·마지막 로그인·누적 사용 크레딧(계약 시작일 이후) */
     @GetMapping("/accounts")
     public ApiResponse<OrgDto.Accounts> getAccounts(
             @AuthenticationPrincipal UserDetails userDetails
     ) {
         return ApiResponse.success(orgAdminService.getAccounts(userDetails.getUsername()));
+    }
+
+    /** 계정 상세 「저장」 — 별칭 · 메일 · 한 달 크레딧 한도(null = 제한 없음, 0 = 크레딧 없음)를 통째로 덮어쓴다 */
+    @PutMapping("/accounts/{loginId}")
+    public ApiResponse<Void> updateAccount(
+            @AuthenticationPrincipal UserDetails userDetails,
+            @PathVariable String loginId,
+            @RequestBody @Valid OrgDto.UpdateAccount request
+    ) {
+        orgAdminService.updateAccount(userDetails.getUsername(), loginId, request);
+        return ApiResponse.success(null);
     }
 
     /** 별칭 지정 — null·빈 문자열이면 제거. 실명 대신 역할명 권장 */

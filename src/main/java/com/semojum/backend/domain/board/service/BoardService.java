@@ -14,6 +14,7 @@ import com.semojum.backend.domain.board.repository.BoardNotificationRepository;
 import com.semojum.backend.domain.board.repository.BoardPostRepository;
 import com.semojum.backend.domain.support.entity.Notice;
 import com.semojum.backend.domain.support.repository.NoticeRepository;
+import com.semojum.backend.global.category.QuestionCategory;
 import com.semojum.backend.global.exception.CustomException;
 import com.semojum.backend.global.exception.ErrorCode;
 import com.semojum.backend.global.s3.S3Service;
@@ -75,13 +76,14 @@ public class BoardService {
 
     /** 게시판 목록 — 공지 고정 + 글 10건씩. 운영자 콘솔은 {@link #listForAdmin} */
     @Transactional(readOnly = true)
-    public BoardDto.PostList list(String userId, Integer page, String field, String keyword, boolean mine) {
+    public BoardDto.PostList list(String userId, Integer page, String field, String keyword, boolean mine,
+                                  boolean answered) {
         User me = user(userId);
         boolean searching = keyword != null && !keyword.isBlank();
-        Page<BoardPost> posts = search(me, isAdmin(me), page, field, keyword, mine, false);
+        Page<BoardPost> posts = search(me, isAdmin(me), page, field, keyword, mine, false, answered);
 
-        // 공지는 그냥 목록을 볼 때만 위에 붙인다 — 검색 결과나 내 글에 공지가 끼면 결과가 아니다
-        List<BoardDto.NoticeRow> notices = searching || mine ? List.of() : visibleNotices(me).stream()
+        // 공지는 그냥 목록을 볼 때만 위에 붙인다 — 검색 결과 · 내 글 · 답변 받은 글에 공지가 끼면 결과가 아니다
+        List<BoardDto.NoticeRow> notices = searching || mine || answered ? List.of() : visibleNotices(me).stream()
                 .map(n -> new BoardDto.NoticeRow(n.getId(), n.getTitle(), ADMIN_AUTHOR,
                         toLocal(n.getCreatedAt()), n.getViewCount()))
                 .toList();
@@ -92,17 +94,17 @@ public class BoardService {
     @Transactional(readOnly = true)
     public BoardDto.PostList listForAdmin(String adminId, Integer page, String field, String keyword, boolean waitingOnly) {
         User admin = user(adminId);
-        Page<BoardPost> posts = search(admin, true, page, field, keyword, false, waitingOnly);
+        Page<BoardPost> posts = search(admin, true, page, field, keyword, false, waitingOnly, false);
         return new BoardDto.PostList(pageNo(page), posts.getTotalElements(), List.of(), rows(posts.getContent(), true));
     }
 
     private Page<BoardPost> search(User me, boolean admin, Integer page, String field, String keyword,
-                                   boolean mine, boolean waitingOnly) {
+                                   boolean mine, boolean waitingOnly, boolean answeredOnly) {
         String f = field == null || field.isBlank() ? "TITLE_CONTENT" : field;
         if (!SEARCH_FIELDS.contains(f)) throw new CustomException(ErrorCode.COMMON_BAD_REQUEST);
         boolean hasKeyword = keyword != null && !keyword.isBlank();
         String like = hasKeyword ? "%" + escapeLike(keyword.trim().toLowerCase()) + "%" : "%";
-        return postRepository.search(me.getId(), admin, mine, waitingOnly, hasKeyword, f, like,
+        return postRepository.search(me.getId(), admin, mine, waitingOnly, answeredOnly, hasKeyword, f, like,
                 PageRequest.of(pageNo(page) - 1, PAGE_SIZE));
     }
 
@@ -113,11 +115,16 @@ public class BoardService {
         for (Object[] row : answerRepository.countByPostIds(ids)) {
             answerCounts.put((Long) row[0], ((Number) row[1]).intValue());
         }
+        Map<Long, Boolean> lastFromAuthor = new HashMap<>();
+        for (Object[] row : answerRepository.findLastFromAuthorByPostIds(ids)) {
+            lastFromAuthor.put((Long) row[0], (Boolean) row[1]);
+        }
         Map<UUID, User> authors = authors(posts.stream().map(BoardPost::getUserId).collect(Collectors.toSet()));
-        return posts.stream().map(p -> new BoardDto.PostRow(p.getId(), p.getTitle(),
+        return posts.stream().map(p -> new BoardDto.PostRow(p.getId(), p.getTitle(), p.getCategory(),
                 answerCounts.getOrDefault(p.getId(), 0),
                 authorName(authors.get(p.getUserId()), rawLoginId),
-                p.isSecret(), p.isHidden(), p.getCreatedAt(), p.getViewCount())).toList();
+                p.isSecret(), p.isHidden(), p.getCreatedAt(), p.getViewCount(),
+                status(lastFromAuthor.get(p.getId())))).toList();
     }
 
     // ── 상세 ─────────────────────────────────────────────────────────
@@ -139,13 +146,12 @@ public class BoardService {
                         s3Service.getPresignedUrl(a.getStoragePath(), URL_TTL)))
                 .toList();
         List<BoardDto.Answer> answers = answerRepository.findByPostIdOrderByIdAsc(postId).stream()
-                .map(a -> new BoardDto.Answer(a.getId(), a.getContent(), a.getUserId().equals(me.getId()),
-                        a.getCreatedAt(), a.getUpdatedAt()))
+                .map(a -> toAnswer(a, a.getUserId().equals(me.getId())))
                 .toList();
         User author = userRepository.findById(post.getUserId()).orElse(null);
-        return new BoardDto.PostDetail(post.getId(), post.getTitle(), post.getContent(),
+        return new BoardDto.PostDetail(post.getId(), post.getTitle(), post.getContent(), post.getCategory(),
                 authorName(author, false), mine, post.isSecret(), post.isHidden(),
-                post.getCreatedAt(), post.getUpdatedAt(), post.getViewCount(), attachments, answers);
+                post.getCreatedAt(), post.getUpdatedAt(), post.getViewCount(), attachments, answers, status(answers));
     }
 
     /** 공지 상세 — 게시판에서 열 때마다 조회수 +1. 게시판에 안 뜨는 공지(고정 해제 · 기간 밖 · 남의 기관)는 없는 것으로 본다 */
@@ -162,7 +168,7 @@ public class BoardService {
     // ── 쓰기 ─────────────────────────────────────────────────────────
 
     @Transactional
-    public BoardDto.Created create(String userId, String title, String content, Boolean secret,
+    public BoardDto.Created create(String userId, String title, String content, String category, Boolean secret,
                                    List<MultipartFile> files) {
         User me = user(userId);
         List<MultipartFile> uploads = nonEmpty(files);
@@ -170,7 +176,9 @@ public class BoardService {
         validateFiles(uploads, 0);
 
         BoardPost post = postRepository.save(BoardPost.builder()
-                .userId(me.getId()).title(title.trim()).content(content).secret(Boolean.TRUE.equals(secret))
+                .userId(me.getId()).title(title.trim()).content(content)
+                .category(validCategory(category, QuestionCategory.RESULT))
+                .secret(Boolean.TRUE.equals(secret))
                 .build());
         uploadAll(post.getId(), uploads);
         log.info("게시글 등록: postId={}, 첨부 {}개", post.getId(), uploads.size());
@@ -182,8 +190,8 @@ public class BoardService {
      * 첨부는 {@code keepAttachmentIds}에 든 것만 남기고, {@code files}를 더한다(합쳐 5개까지).
      */
     @Transactional
-    public BoardDto.PostDetail update(String userId, Long postId, String title, String content, Boolean secret,
-                                      List<Long> keepAttachmentIds, List<MultipartFile> files) {
+    public BoardDto.PostDetail update(String userId, Long postId, String title, String content, String category,
+                                      Boolean secret, List<Long> keepAttachmentIds, List<MultipartFile> files) {
         User me = user(userId);
         BoardPost post = visiblePost(postId, false);
         if (!post.getUserId().equals(me.getId())) throw new CustomException(ErrorCode.COMMON_FORBIDDEN);
@@ -195,7 +203,7 @@ public class BoardService {
         List<BoardAttachment> removed = current.stream().filter(a -> !keep.contains(a.getId())).toList();
         validateFiles(uploads, current.size() - removed.size());
 
-        post.update(title.trim(), content, Boolean.TRUE.equals(secret));
+        post.update(title.trim(), content, validCategory(category, post.getCategory()), Boolean.TRUE.equals(secret));
         attachmentRepository.deleteAll(removed);
         uploadAll(postId, uploads);
         removed.forEach(a -> deleteObjectQuietly(a.getStoragePath()));
@@ -212,6 +220,22 @@ public class BoardService {
         log.info("게시글 삭제(작성자): postId={}", postId);
     }
 
+    /**
+     * 이어 묻기 — 글쓴이만, 같은 글에. 운영자 답변과 한 줄로 이어지고 글은 다시 「처리 중」이 된다.
+     * 비밀글이면 이어 쓴 글도 작성자 · 운영자만 본다(글을 열 수 있는 사람만 본다).
+     */
+    @Transactional
+    public BoardDto.Answer createFollowUp(String userId, Long postId, BoardDto.CreateFollowUp request) {
+        User me = user(userId);
+        BoardPost post = visiblePost(postId, false);
+        if (!post.getUserId().equals(me.getId())) throw new CustomException(ErrorCode.COMMON_FORBIDDEN);
+        String content = validAnswer(request == null ? null : request.content());
+        BoardAnswer followUp = answerRepository.save(BoardAnswer.builder()
+                .postId(postId).userId(me.getId()).content(content).fromAuthor(true).build());
+        log.info("게시글 이어 묻기: postId={}, answerId={}", postId, followUp.getId());
+        return toAnswer(followUp, true);
+    }
+
     // ── 운영자 ───────────────────────────────────────────────────────
 
     /** 답변 등록 — 「글쓴이에게 알림 보내기」를 체크했으면 글쓴이 알림을 만들거나 다시 안 읽음으로 */
@@ -221,7 +245,7 @@ public class BoardService {
         BoardPost post = visiblePost(postId, true);
         String content = validAnswer(request == null ? null : request.content());
         BoardAnswer answer = answerRepository.save(BoardAnswer.builder()
-                .postId(postId).userId(admin.getId()).content(content).build());
+                .postId(postId).userId(admin.getId()).content(content).fromAuthor(false).build());
 
         boolean notify = Boolean.TRUE.equals(request.notifyAuthor());
         if (notify) {
@@ -231,7 +255,7 @@ public class BoardService {
                             .userId(post.getUserId()).postId(postId).lastAnsweredAt(answer.getCreatedAt()).build()));
         }
         log.info("게시판 답변 등록: postId={}, answerId={}, notify={}", postId, answer.getId(), notify);
-        return new BoardDto.Answer(answer.getId(), answer.getContent(), true, answer.getCreatedAt(), answer.getUpdatedAt());
+        return toAnswer(answer, true);
     }
 
     /** 답변 수정 — 그 답변을 쓴 운영자만 */
@@ -239,7 +263,7 @@ public class BoardService {
     public BoardDto.Answer updateAnswer(String adminId, Long answerId, BoardDto.UpdateAnswer request) {
         BoardAnswer answer = ownAnswer(adminId, answerId);
         answer.update(validAnswer(request == null ? null : request.content()));
-        return new BoardDto.Answer(answer.getId(), answer.getContent(), true, answer.getCreatedAt(), answer.getUpdatedAt());
+        return toAnswer(answer, true);
     }
 
     /** 답변 삭제 — 그 답변을 쓴 운영자만 */
@@ -328,11 +352,25 @@ public class BoardService {
                         s3Service.getPresignedUrl(a.getStoragePath(), URL_TTL)))
                 .toList();
         List<BoardDto.Answer> answers = answerRepository.findByPostIdOrderByIdAsc(post.getId()).stream()
-                .map(a -> new BoardDto.Answer(a.getId(), a.getContent(), false, a.getCreatedAt(), a.getUpdatedAt()))
+                .map(a -> toAnswer(a, a.getUserId().equals(me.getId())))
                 .toList();
-        return new BoardDto.PostDetail(post.getId(), post.getTitle(), post.getContent(), authorName(me, false), true,
+        return new BoardDto.PostDetail(post.getId(), post.getTitle(), post.getContent(), post.getCategory(),
+                authorName(me, false), true,
                 post.isSecret(), post.isHidden(), post.getCreatedAt(), post.getUpdatedAt(), post.getViewCount(),
-                attachments, answers);
+                attachments, answers, status(answers));
+    }
+
+    private static BoardDto.Answer toAnswer(BoardAnswer a, boolean mine) {
+        return new BoardDto.Answer(a.getId(), a.getContent(), mine, a.getCreatedAt(), a.getUpdatedAt(), a.isFromAuthor());
+    }
+
+    /** 처리 상태 — 마지막 글이 운영자 답변이면 ANSWERED, 답변이 없거나 글쓴이가 이어 물었으면 WAITING */
+    private static String status(Boolean lastFromAuthor) {
+        return lastFromAuthor == null || lastFromAuthor ? "WAITING" : "ANSWERED";
+    }
+
+    private static String status(List<BoardDto.Answer> thread) {
+        return status(thread.isEmpty() ? null : thread.get(thread.size() - 1).fromAuthor());
     }
 
     private BoardAnswer ownAnswer(String adminId, Long answerId) {
@@ -354,6 +392,16 @@ public class BoardService {
                 || content == null || content.isBlank() || content.length() > MAX_CONTENT) {
             throw new CustomException(ErrorCode.COMMON_BAD_REQUEST);
         }
+    }
+
+    /**
+     * 분류 확인 — 안 보내면 {@code fallback}(새 글은 피그마 기본값 「점역 결과」, 수정은 원래 분류).
+     * 분류를 모르는 구 앱이 글을 쓰거나 고쳐도 깨지지 않게 하려고 필수로 두지 않는다.
+     */
+    private static String validCategory(String category, String fallback) {
+        if (category == null || category.isBlank()) return fallback;
+        if (!QuestionCategory.ALL.contains(category)) throw new CustomException(ErrorCode.COMMON_BAD_REQUEST);
+        return category;
     }
 
     private String validAnswer(String content) {

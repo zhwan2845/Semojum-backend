@@ -44,7 +44,7 @@ public class AdminMonitorDto {
             String orgName,
             LocalDateTime requestedAt,
             String clientIp,
-            String clientLocation,    // IP 기반 위치 (조회 시점 GeoIP, 실패·사설 IP는 null)
+            String clientLocation,    // 항상 null — IP를 외부 위치 조회 서비스에 보내지 않는다. 콘솔이 읽는 칸이라 남겨 둔다
             String clientOs,
             String clientBrowser,
             String clientUserAgent

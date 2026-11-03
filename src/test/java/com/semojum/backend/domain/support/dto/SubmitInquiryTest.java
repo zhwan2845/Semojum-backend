@@ -34,15 +34,15 @@ class SubmitInquiryTest {
     @Test
     void 필수값_이메일_형식_길이를_검증한다() {
         SupportDto.SubmitInquiry bad = new SupportDto.SubmitInquiry(
-                " ", "가".repeat(51), "not-an-email", "가".repeat(2001), null);
+                " ", "가".repeat(51), "not-an-email", "가".repeat(201), "가".repeat(101), "가".repeat(2001), null);
 
         Set<String> fields = validator.validate(bad).stream()
                 .map(ConstraintViolation::getPropertyPath).map(Object::toString).collect(Collectors.toSet());
-        assertEquals(Set.of("type", "name", "email", "message"), fields);
+        assertEquals(Set.of("type", "name", "email", "title", "orgName", "message"), fields);
     }
 
     @Test
     void 이름과_허니팟은_선택이다() {
-        assertTrue(validator.validate(new SupportDto.SubmitInquiry("ETC", null, "a@b.com", "내용", null)).isEmpty());
+        assertTrue(validator.validate(new SupportDto.SubmitInquiry("ETC", null, "a@b.com", null, null, "내용", null)).isEmpty());
     }
 }

@@ -9,7 +9,6 @@ import com.semojum.backend.domain.job.scheduler.JobDispatcher;
 import com.semojum.backend.domain.result.entity.*;
 import com.semojum.backend.domain.result.repository.*;
 import com.semojum.backend.domain.result.service.PageResultSerializer;
-import com.semojum.backend.global.grpc.AiServerPool;
 import com.semojum.backend.global.s3.S3Service;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -45,7 +44,7 @@ public class SseService {
     private final PageResultRepository pageResultRepository;
     private final RedisTemplate<String, String> redisTemplate;
     private final ObjectMapper objectMapper;
-    private final AiServerPool aiServerPool;
+    private final ConversionEtaEstimator conversionEtaEstimator;
     private final PageResultSerializer pageResultSerializer;
     private final JobDispatcher jobDispatcher;
     private final PageRepository pageRepository;
@@ -158,13 +157,14 @@ public class SseService {
                 }
                 emittedUpTo = cursor;
 
-                // queue_position 이벤트
-                if (pendingCount > 0) {
+                // queue_position 이벤트 — 마지막 쪽들이 처리 중일 때(대기 0)도 보낸다. 잔여 시간이 끝까지 줄어들게
+                int remainingCount = totalPages - doneCount;
+                if (remainingCount > 0) {
                     Map<String, Object> queueEvent = new LinkedHashMap<>();
                     queueEvent.put("type", "queue_position");
                     queueEvent.put("position", pendingCount);
-                    // 페이지당 약 30초 가정, 총 슬롯 수만큼 동시 처리되므로 슬롯 수로 나눈다
-                    queueEvent.put("estimated_wait_sec", (int) Math.ceil(pendingCount * 30.0 / aiServerPool.getTotalSlots()));
+                    // 남은 쪽(대기 + 처리 중)이 다 끝날 때까지의 시간 — 실제 처리 속도로 잰다(ConversionEtaEstimator)
+                    queueEvent.put("estimated_wait_sec", conversionEtaEstimator.remainingSeconds(jobId, remainingCount));
                     emitter.send(SseEmitter.event().name("queue_position").data(objectMapper.writeValueAsString(queueEvent)));
                     lastSentAt = System.currentTimeMillis();
                 }

@@ -6,6 +6,7 @@ import com.semojum.backend.domain.auth.enums.UserStatus;
 import com.semojum.backend.domain.auth.repository.UserRepository;
 import com.semojum.backend.domain.auth.repository.UserSessionRepository;
 import com.semojum.backend.domain.billing.repository.CreditTransactionRepository;
+import com.semojum.backend.domain.billing.service.CreditBalanceService;
 import com.semojum.backend.domain.job.entity.Job;
 import com.semojum.backend.domain.job.repository.JobRepository;
 import com.semojum.backend.domain.job.service.JobCancelService;
@@ -16,6 +17,7 @@ import com.semojum.backend.global.exception.CustomException;
 import com.semojum.backend.global.exception.ErrorCode;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -50,6 +52,11 @@ public class OrgAdminService {
     private final JobRepository jobRepository;
     private final JobCancelService jobCancelService;
     private final JobProgressReader jobProgressReader;
+    private final CreditBalanceService creditBalanceService;
+
+    // 크레딧 판매 단가(원, 부가세 포함) — 임시값. 정해지면 설정만 고친다(application.yaml billing.credit-price-krw)
+    @Value("${billing.credit-price-krw}")
+    private long creditPriceKrw;
 
     @Transactional(readOnly = true)
     public OrgDto.Dashboard getDashboard(String adminUserId) {
@@ -76,6 +83,14 @@ public class OrgAdminService {
                 org.getCreditAllocated(), used, org.getCreditAllocated() - used, monthly);
     }
 
+
+    /** 크레딧 추가 요청 창의 예상 금액 — 요청할 양 × 단가(부가세 포함). 양이 1보다 작으면 400 */
+    public OrgDto.CreditEstimate getCreditEstimate(String adminUserId, long credits) {
+        resolveOrgAdmin(adminUserId);
+        if (credits < 1) throw new CustomException(ErrorCode.COMMON_BAD_REQUEST);
+        return new OrgDto.CreditEstimate(credits, creditPriceKrw, Math.multiplyExact(credits, creditPriceKrw));
+    }
+
     // "사용" 열 = 계약 시작일 이후 누적 사용 크레딧 (월 단위 아님).
     // 계약 시작일 미설정 기관은 전체 누적
     @Transactional(readOnly = true)
@@ -91,10 +106,19 @@ public class OrgAdminService {
             perUser.put((UUID) row[0], ((Number) row[1]).longValue());
         }
 
+        // 이번 달 사용 — 계정 한도와 견주는 값. 기관 계정을 한 번에 센다(계정마다 세면 N+1)
+        YearMonth month = YearMonth.now(KST);
+        Map<UUID, Long> thisMonth = new HashMap<>();
+        for (Object[] row : creditTransactionRepository.sumPerOrgUserBetween(
+                month.atDay(1).atStartOfDay(KST).toInstant(), month.plusMonths(1).atDay(1).atStartOfDay(KST).toInstant())) {
+            if (org.getId().equals(row[0])) thisMonth.put((UUID) row[1], ((Number) row[2]).longValue());
+        }
+
         List<OrgDto.Account> items = userRepository.findByOrganizationIdAndDeletedAtIsNullOrderByLoginIdAsc(org.getId()).stream()
                 .map(u -> new OrgDto.Account(u.getLoginId(), u.getAlias(),
                         u.getStatus().name(), u.getRole().name(), u.getLastLoginAt(),
-                        perUser.getOrDefault(u.getId(), 0L), u.getId().equals(admin.getId())))
+                        perUser.getOrDefault(u.getId(), 0L), u.getId().equals(admin.getId()),
+                        u.getEmail(), u.getCreditLimit(), thisMonth.getOrDefault(u.getId(), 0L), u.getCreatedAt()))
                 .toList();
         return new OrgDto.Accounts(started, items);
     }
@@ -105,6 +129,24 @@ public class OrgAdminService {
         User target = resolveSameOrgTarget(admin, loginId);
         target.changeAlias(alias == null || alias.isBlank() ? null : alias.trim());
         log.info("별칭 변경: org={}, loginId={}", admin.getOrganization().getCode(), loginId);
+    }
+
+    /**
+     * 계정 상세 「저장」 — 별칭 · 메일 · 크레딧 한도. 본인(기관 관리자) 계정도 고칠 수 있다(잠금만 본인 불가).
+     * 한도는 다음 쪽부터 바로 걸린다 — 관문이 기억한 계정 잔여를 버린다.
+     */
+    @Transactional
+    public void updateAccount(String adminUserId, String loginId, OrgDto.UpdateAccount request) {
+        User admin = resolveOrgAdmin(adminUserId);
+        User target = resolveSameOrgTarget(admin, loginId);
+        target.changeOrgProfile(trimToNull(request.alias()), trimToNull(request.email()), request.creditLimit());
+        creditBalanceService.evictAccount(target.getId());
+        log.info("계정 상세 저장: org={}, loginId={}, creditLimit={}",
+                admin.getOrganization().getCode(), loginId, request.creditLimit());
+    }
+
+    private static String trimToNull(String s) {
+        return s == null || s.isBlank() ? null : s.trim();
     }
 
     /**

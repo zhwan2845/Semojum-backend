@@ -1,7 +1,9 @@
 package com.semojum.backend.domain.job.service;
 
 import com.itextpdf.kernel.pdf.PdfDocument;
+import com.itextpdf.kernel.exceptions.BadPasswordException;
 import com.itextpdf.kernel.pdf.PdfReader;
+import com.itextpdf.kernel.pdf.ReaderProperties;
 import com.itextpdf.kernel.pdf.PdfWriter;
 import com.semojum.backend.domain.auth.entity.User;
 import com.semojum.backend.domain.auth.repository.UserRepository;
@@ -24,6 +26,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDateTime;
@@ -33,7 +37,6 @@ import java.util.List;
 import java.util.UUID;
 import com.semojum.backend.domain.auth.enums.Role;
 import com.semojum.backend.domain.job.scheduler.JobDispatcher;
-import com.semojum.backend.global.thumbnail.ThumbnailService;
 import com.semojum.backend.global.client.ClientInfoResolver;
 import java.util.Set;
 
@@ -57,7 +60,6 @@ public class JobService {
     private final S3Service s3Service;
     private final RedisTemplate<String, String> redisTemplate;
     private final JobDispatcher jobDispatcher;
-    private final ThumbnailService thumbnailService;
     private final HwpToPdfConverter hwpToPdfConverter;
     private final UploadOptionsResolver uploadOptionsResolver;
 
@@ -121,11 +123,39 @@ public class JobService {
         }
     }
 
-    public JobResponseDto.Create createJob(String userId, List<MultipartFile> files, String mode,
+    /** 한 작업의 업로드 합계 상한 — 파일 하나의 상한(max-file-size)과 같다 */
+    static final long MAX_TOTAL_UPLOAD_BYTES = 100L * 1024 * 1024;
+
+    /**
+     * 이미지 여러 장은 합계로 100MB까지 받는다 — 파일 하나의 상한과 같은 기준이다. 넘으면 JOB4009.
+     *
+     * <p>요청 한도(max-request-size 105MB)로 막으면 안 된다 — 멀티파트 경계 · 폼 필드 몫의 여유라
+     * 100MB로 내리면 100MB짜리 PDF 하나가 거절되고, 그대로 두면 이미지 합계가 105MB까지 들어온다.
+     */
+    static void validateTotalSize(List<Long> sizes) {
+        if (sizes.stream().mapToLong(Long::longValue).sum() > MAX_TOTAL_UPLOAD_BYTES) {
+            throw new CustomException(ErrorCode.JOB_FILE_TOO_LARGE);
+        }
+    }
+
+    public JobResponseDto.Create createJob(String userId, List<MultipartFile> files,
                                            boolean insertPageNumber, String footerText,
                                            LayoutOptions requestedOptions, String formId,
                                            BrailleOptions requestedBrailleOptions,
                                            ClientInfoResolver.ClientInfo clientInfo)
+            throws Exception {
+        return createJob(userId, files, insertPageNumber, footerText, requestedOptions, formId,
+                requestedBrailleOptions, clientInfo, null);
+    }
+
+    /**
+     * @param pdfPassword 암호 PDF의 문서 암호 — 쪽을 나눌 때만 쓰고 저장 · 로그하지 않는다. 나눈 쪽 PDF에는 암호가 없다
+     */
+    public JobResponseDto.Create createJob(String userId, List<MultipartFile> files,
+                                           boolean insertPageNumber, String footerText,
+                                           LayoutOptions requestedOptions, String formId,
+                                           BrailleOptions requestedBrailleOptions,
+                                           ClientInfoResolver.ClientInfo clientInfo, String pdfPassword)
             throws Exception {
 
         // 꼬리말(묵자) 정리 — 빈 값은 null, 200자 초과는 거절 (예전 서버 점역의 입력 상한을 그대로 둔다)
@@ -152,20 +182,20 @@ public class JobService {
 
         // 2. 모드는 파일 종류가 정한다 — 사용자가 고르지 않는다.
         //    PDF·HWP·HWPX·이미지 → c(원본 | 텍스트 | 점자 한 번에), TXT → b(원문 | 점자).
-        //    구 클라이언트가 보내는 mode는 받기만 하고 쓰지 않는다 — a를 보내도 c로 만든다(텍스트 결과는 c에 다 들어 있다)
+        //    구 클라이언트가 보내는 mode 폼 필드는 선언하지 않아 Spring이 무시한다
         List<String> exts = (files == null ? List.<MultipartFile>of() : files).stream()
                 .map(f -> extensionOf(f.getOriginalFilename()))
                 .toList();
         validateUploadFiles(exts);
+        validateTotalSize(files.stream().map(MultipartFile::getSize).toList());
 
-        String requestedMode = mode;
         String ext = exts.get(0);
-        mode = modeForExtension(ext);
+        String mode = modeForExtension(ext);
         exts.forEach(JobService::modeForExtension);   // 섞인 목록도 확장자별로 검증한다
 
         MultipartFile file = files.get(0);
-        log.info("Job 생성 시작: mode={}(요청 {}), file={} ({}KB){}, user={}",
-                mode, requestedMode, file.getOriginalFilename(), file.getSize() / 1024,
+        log.info("Job 생성 시작: mode={}, file={} ({}KB){}, user={}",
+                mode, file.getOriginalFilename(), file.getSize() / 1024,
                 files.size() > 1 ? " 외 " + (files.size() - 1) + "장" : "", user.getLoginId());
 
         // 4. job_id 발급
@@ -210,8 +240,8 @@ public class JobService {
                 }
 
                 // 파일 경로로 연다 — iText가 디스크에서 필요한 부분만 읽는다
-                try (PdfReader reader = new PdfReader(pdfPath.toString());
-                     PdfDocument pdfDoc = new PdfDocument(reader)) {
+                try (PdfReader reader = openPdf(pdfPath, pdfPassword);
+                     PdfDocument pdfDoc = openDocument(reader, pdfPassword)) {
 
                     int totalPages = pdfDoc.getNumberOfPages();
 
@@ -232,16 +262,6 @@ public class JobService {
                         job.recordClientInfo(clientInfo.ip(), clientInfo.os(), clientInfo.browser(), clientInfo.userAgent());
                     }
                     jobRepository.saveAndFlush(job);
-
-                    try {
-                        byte[] thumbnailBytes = thumbnailService.generatePdfThumbnail(pdfPath);
-                        String thumbnailKey = jobId + "/thumbnail.png";
-                        String thumbnailFullPath = s3Service.uploadFile(thumbnailKey, thumbnailBytes, "image/png");
-                        job.updateThumbnailUrl(s3Service.getPublicUrl(thumbnailFullPath));
-                        jobRepository.save(job);
-                    } catch (Exception e) {
-                        log.warn("썸네일 생성 실패: jobId={}", jobId, e);
-                    }
 
                     redisTemplate.opsForHash().put(JobRedisKeys.pages(jobId), JobRedisKeys.TOTAL_PAGES, String.valueOf(totalPages));
 
@@ -280,6 +300,30 @@ public class JobService {
                 if (converted != null) converted.close();
                 deleteQuietly(upload);
             }
+        }
+    }
+
+    /**
+     * PDF를 연다. 문서 암호가 있으면 그 암호로 연다.
+     *
+     * <p>{@code setUnethicalReading(true)} — 편집 · 복사 제한(소유자 암호)이 걸린 PDF는 열리지만 쪽을 복사하는 순간
+     * 「소유자 암호로 열지 않았다」로 실패한다(실측 — 열람 암호를 맞게 넣어도 같다). 사용자가 자기 문서를 점역하려고
+     * 올린 것이라 제한을 따지지 않고 쪽을 나눈다.
+     */
+    private static PdfReader openPdf(Path pdfPath, String password) throws IOException {
+        ReaderProperties props = new ReaderProperties();
+        if (password != null && !password.isEmpty()) props.setPassword(password.getBytes(StandardCharsets.UTF_8));
+        return new PdfReader(pdfPath.toString(), props).setUnethicalReading(true);
+    }
+
+    /** 열람 암호가 걸렸는데 암호가 없으면 JOB4018, 틀렸으면 JOB4019 — 앱이 암호 입력 창(Case 3)을 띄운다 */
+    private static PdfDocument openDocument(PdfReader reader, String password) {
+        try {
+            return new PdfDocument(reader);
+        } catch (BadPasswordException e) {
+            boolean given = password != null && !password.isEmpty();
+            log.warn("암호 PDF 업로드: {}", given ? "암호 틀림" : "암호 없음");
+            throw new CustomException(given ? ErrorCode.JOB_PDF_PASSWORD_WRONG : ErrorCode.JOB_PDF_PASSWORD_REQUIRED);
         }
     }
 
@@ -330,17 +374,6 @@ public class JobService {
             job.recordClientInfo(clientInfo.ip(), clientInfo.os(), clientInfo.browser(), clientInfo.userAgent());
         }
         jobRepository.saveAndFlush(job);
-
-        // 썸네일은 첫 장 — PDF처럼 렌더할 게 없어 PNG로 다시 인코딩만 한다. 실패는 삼킨다
-        try {
-            byte[] thumbnailBytes = thumbnailService.generateImageThumbnail(files.get(0).getBytes());
-            String thumbnailKey = jobId + "/thumbnail.png";
-            String thumbnailFullPath = s3Service.uploadFile(thumbnailKey, thumbnailBytes, "image/png");
-            job.updateThumbnailUrl(s3Service.getPublicUrl(thumbnailFullPath));
-            jobRepository.save(job);
-        } catch (Exception e) {
-            log.warn("썸네일 생성 실패: jobId={}", jobId, e);
-        }
 
         redisTemplate.opsForHash().put(JobRedisKeys.pages(jobId), JobRedisKeys.TOTAL_PAGES, String.valueOf(totalPages));
 

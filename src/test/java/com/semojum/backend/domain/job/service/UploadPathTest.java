@@ -1,7 +1,10 @@
 package com.semojum.backend.domain.job.service;
 
 import com.itextpdf.kernel.pdf.PdfDocument;
+import com.itextpdf.kernel.pdf.EncryptionConstants;
+import com.itextpdf.kernel.pdf.PdfReader;
 import com.itextpdf.kernel.pdf.PdfWriter;
+import com.itextpdf.kernel.pdf.WriterProperties;
 import com.semojum.backend.domain.auth.entity.User;
 import com.semojum.backend.domain.auth.repository.UserRepository;
 import com.semojum.backend.domain.job.dto.BrailleOptions;
@@ -14,7 +17,6 @@ import com.semojum.backend.global.exception.CustomException;
 import com.semojum.backend.global.exception.ErrorCode;
 import com.semojum.backend.global.hwp.HwpToPdfConverter;
 import com.semojum.backend.global.s3.S3Service;
-import com.semojum.backend.global.thumbnail.ThumbnailService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.data.redis.core.HashOperations;
@@ -46,7 +48,6 @@ class UploadPathTest {
 
     JobRepository jobRepository;
     S3Service s3Service;
-    ThumbnailService thumbnailService;
     HwpToPdfConverter hwpToPdfConverter;
     JobService service;
     List<String> uploadedKeys;
@@ -81,12 +82,10 @@ class UploadPathTest {
         when(resolver.resolve(any(), any(), any(), any()))
                 .thenReturn(new UploadOptionsResolver.Resolved(LayoutOptions.defaults(), BrailleOptions.defaults()));
 
-        thumbnailService = mock(ThumbnailService.class);
-        when(thumbnailService.generatePdfThumbnail(any(Path.class))).thenReturn(new byte[]{1});
         hwpToPdfConverter = mock(HwpToPdfConverter.class);
 
         service = new JobService(jobRepository, mock(PageRepository.class), users, s3Service, redis,
-                mock(JobDispatcher.class), thumbnailService, hwpToPdfConverter, resolver);
+                mock(JobDispatcher.class), hwpToPdfConverter, resolver);
     }
 
     private static byte[] pdf(int pages) {
@@ -115,7 +114,7 @@ class UploadPathTest {
     }
 
     private JobResponseDto.Create upload(MultipartFile file) throws Exception {
-        return service.createJob(userId, List.of(file), null, false, null, null, null, null, null);
+        return service.createJob(userId, List.of(file), false, null, null, null, null, null);
     }
 
     @Test
@@ -124,9 +123,9 @@ class UploadPathTest {
 
         assertEquals(3, created.totalPages());
         String jobId = created.jobId();
-        assertEquals(List.of(jobId + "/thumbnail.png", jobId + "/pages/page-1.pdf",
+        // 쪽 PDF만 올린다 — 썸네일(공개 읽기 thumbnail.png)은 쓰는 곳이 없어 만들지 않는다
+        assertEquals(List.of(jobId + "/pages/page-1.pdf",
                 jobId + "/pages/page-2.pdf", jobId + "/pages/page-3.pdf"), uploadedKeys);
-        verify(thumbnailService).generatePdfThumbnail(any(Path.class));
     }
 
     @Test
@@ -172,5 +171,59 @@ class UploadPathTest {
 
         assertEquals(ErrorCode.JOB_HWP_CONVERT_FAILED, e.getErrorCode());
         assertEquals(before, tempUploads());
+    }
+
+    // ── 암호 PDF (Case 3) ────────────────────────────────────────────
+
+    /** userPassword가 null이면 소유자 암호(편집 · 복사 제한)만 건다 */
+    private static byte[] encryptedPdf(int pages, String userPassword) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        WriterProperties props = new WriterProperties().setStandardEncryption(
+                userPassword == null ? null : userPassword.getBytes(), "owner-secret".getBytes(),
+                EncryptionConstants.ALLOW_PRINTING, EncryptionConstants.ENCRYPTION_AES_128);
+        try (PdfDocument doc = new PdfDocument(new PdfWriter(out, props))) {
+            for (int i = 0; i < pages; i++) doc.addNewPage();
+        }
+        return out.toByteArray();
+    }
+
+    private JobResponseDto.Create upload(MultipartFile file, String password) throws Exception {
+        return service.createJob(userId, List.of(file), false, null, null, null, null, null, password);
+    }
+
+    @Test
+    void 열람_암호가_걸린_PDF를_암호_없이_올리면_JOB4018() {
+        CustomException e = assertThrows(CustomException.class,
+                () -> upload(noGetBytes("시험지.pdf", encryptedPdf(2, "1234")), null));
+        assertEquals(ErrorCode.JOB_PDF_PASSWORD_REQUIRED, e.getErrorCode());
+        verify(jobRepository, never()).saveAndFlush(any());
+    }
+
+    @Test
+    void 문서_암호가_틀리면_JOB4019() {
+        CustomException e = assertThrows(CustomException.class,
+                () -> upload(noGetBytes("시험지.pdf", encryptedPdf(2, "1234")), "0000"));
+        assertEquals(ErrorCode.JOB_PDF_PASSWORD_WRONG, e.getErrorCode());
+    }
+
+    /** 맞는 암호면 쪽을 나눈다 — 나눈 쪽 PDF에는 암호가 없어야 렌더 · AI가 그대로 읽는다 */
+    @Test
+    void 맞는_암호면_쪽을_나누고_쪽_PDF에는_암호가_없다() throws Exception {
+        List<byte[]> pagePdfs = new ArrayList<>();
+        when(s3Service.uploadFile(anyString(), any(), any())).thenAnswer(i -> {
+            pagePdfs.add(i.getArgument(1));
+            return "s3://b/" + i.getArgument(0);
+        });
+
+        assertEquals(2, upload(noGetBytes("시험지.pdf", encryptedPdf(2, "1234")), "1234").totalPages());
+        try (PdfDocument page = new PdfDocument(new PdfReader(new java.io.ByteArrayInputStream(pagePdfs.get(0))))) {
+            assertFalse(page.getReader().isEncrypted());
+        }
+    }
+
+    /** 편집 · 복사 제한만 걸린 PDF는 암호 없이 열린다 — 예전엔 쪽 복사에서 실패했다 */
+    @Test
+    void 편집_제한만_걸린_PDF는_암호_없이_나눈다() throws Exception {
+        assertEquals(3, upload(noGetBytes("교재.pdf", encryptedPdf(3, null)), null).totalPages());
     }
 }

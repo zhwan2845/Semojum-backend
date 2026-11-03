@@ -22,4 +22,8 @@ public interface UserRepository extends JpaRepository<User, UUID> {
     @Query("select u.loginId from User u where u.loginId like concat(:prefix, '%')")
     List<String> findLoginIdsByPrefix(@Param("prefix") String prefix);
 
+
+    /** 계정 크레딧 한도 — null = 제한 없음 (크레딧 관문용, 엔티티를 읽지 않는다) */
+    @Query("SELECT u.creditLimit FROM User u WHERE u.id = :userId")
+    Long findCreditLimitById(@Param("userId") UUID userId);
 }

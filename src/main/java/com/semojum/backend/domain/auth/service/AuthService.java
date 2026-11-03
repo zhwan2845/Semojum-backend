@@ -13,6 +13,7 @@ import com.semojum.backend.global.jwt.JwtProvider;
 import com.semojum.backend.global.config.ConsoleOrigins;
 import lombok.RequiredArgsConstructor;
 import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -39,6 +40,10 @@ public class AuthService {
     private final PasswordEncoder passwordEncoder;
     private final ConsoleOrigins consoleOrigins;
     private final LoginAttemptService loginAttemptService;
+
+    // 「로그인 상태 유지」 리프레시 토큰 수명(ms) — application.yaml jwt.keep-login-refresh-token-expiry
+    @Value("${jwt.keep-login-refresh-token-expiry}")
+    private long keepLoginRefreshExpiry;
 
     @Transactional
     public AuthResponseDto.Login login(AuthRequestDto.Login request, String origin) {
@@ -93,10 +98,13 @@ public class AuthService {
 
         // JWT 발급 (subject: UUID)
         String accessToken = jwtProvider.generateAccessToken(user.getId().toString());
-        String refreshToken = jwtProvider.generateRefreshToken(user.getId().toString());
+        // 「로그인 상태 유지」면 리프레시 토큰을 길게 — 세션 만료(DB)도 같은 수명이라야 재발급이 된다
+        long refreshExpiry = Boolean.TRUE.equals(request.keepLoggedIn())
+                ? keepLoginRefreshExpiry : jwtProvider.getRefreshTokenExpiry();
+        String refreshToken = jwtProvider.generateRefreshToken(user.getId().toString(), refreshExpiry);
 
         // 리프레시 토큰 세션 저장 (계정당 활성 1개)
-        saveSession(user, refreshToken);
+        saveSession(user, refreshToken, refreshExpiry);
 
         log.info("로그인 성공: loginId={}", request.loginId());
         return new AuthResponseDto.Login(accessToken, refreshToken, user.getRole().name(),
@@ -168,10 +176,9 @@ public class AuthService {
         }
     }
 
-    private void saveSession(User user, String refreshToken) {
+    private void saveSession(User user, String refreshToken, long expiryMillis) {
         String hash = jwtProvider.hashToken(refreshToken);
-        LocalDateTime expiresAt = LocalDateTime.now()
-                .plusSeconds(jwtProvider.getRefreshTokenExpiry() / 1000);
+        LocalDateTime expiresAt = LocalDateTime.now().plusSeconds(expiryMillis / 1000);
 
         UserSession session = UserSession.builder()
                 .user(user)

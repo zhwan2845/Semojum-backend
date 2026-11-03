@@ -58,7 +58,9 @@ public class JobResponseDto {
             String overallStatus,
             Map<String, String> pages,
             // 기관 잔여 크레딧이 떨어져 AI에 보내지 않고 막은 쪽이 있는가 — 앱이 「크레딧 부족」을 알린다
-            boolean creditExhausted
+            boolean creditExhausted,
+            // 남은 쪽이 다 끝날 때까지 예상 시간(초) — 변환 진행 화면 「잔여 …」. 끝났거나 진행 기록이 없으면(DB 응답) null
+            Integer estimatedRemainingSec
     ) {}
 
     /**

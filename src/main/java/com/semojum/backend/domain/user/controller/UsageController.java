@@ -1,6 +1,7 @@
 package com.semojum.backend.domain.user.controller;
 
 import com.semojum.backend.domain.user.dto.UsageDto;
+import com.semojum.backend.domain.user.service.CreditHistoryService;
 import com.semojum.backend.domain.user.service.UsageService;
 import com.semojum.backend.global.exception.ApiResponse;
 import lombok.RequiredArgsConstructor;
@@ -21,6 +22,7 @@ import java.time.LocalDate;
 public class UsageController {
 
     private final UsageService usageService;
+    private final CreditHistoryService creditHistoryService;
 
     /** 월 사용량 요약 — month 미지정 시 이번 달(KST). "지난달" 탭은 month=YYYY-MM */
     @GetMapping
@@ -48,5 +50,19 @@ public class UsageController {
             @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to
     ) {
         return ApiResponse.success(usageService.getJobs(userDetails.getUsername(), from, to));
+    }
+
+    /**
+     * 마이페이지 [과금 이력] 상세 내역 — 내 사용(작업별) + 우리 기관 충전(크레딧 추가 주문), 최신순.
+     * 기본 기간은 올해 1월 1일 ~ 오늘. type: ALL(기본) · USE · CHARGE
+     */
+    @GetMapping("/credit-history")
+    public ApiResponse<UsageDto.CreditHistory> getCreditHistory(
+            @AuthenticationPrincipal UserDetails userDetails,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
+            @RequestParam(required = false) String type
+    ) {
+        return ApiResponse.success(creditHistoryService.getHistory(userDetails.getUsername(), from, to, type));
     }
 }

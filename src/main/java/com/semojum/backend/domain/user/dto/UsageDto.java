@@ -3,6 +3,7 @@ package com.semojum.backend.domain.user.dto;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.UUID;
 
 /** 사용량 (점역사 본인) 응답 */
 public class UsageDto {
@@ -62,4 +63,28 @@ public class UsageDto {
 
     /** @param source PDF_HWP(PDF · HWP · HWPX) · IMAGE(JPG · JPEG · PNG) · TEXT(TXT · 새 문서) */
     public record SourceCredit(String source, long credits) {}
+
+    /**
+     * 마이페이지 [과금 이력] 상세 내역 — 내 사용(작업별)과 우리 기관의 충전(크레딧 추가 주문)을 날짜순으로.
+     *
+     * <p>행마다 그 뒤의 기관 잔여({@code balanceAfter})를 싣는다(피그마 「잔여 크레딧」 열). ⚠️ 기관 잔여는 같은 기관
+     * 다른 계정의 사용으로도 줄어서 내 행 사이 차이에 다른 계정 사용이 섞인다 — 노션 열람 범위와 어긋나지만
+     * 피그마를 따른다(2026-11-02 결정: 구현 기준은 피그마).
+     *
+     * @param orgRemaining 지금 기관 잔여(사용량 화면 카드와 같은 값). 무소속이면 null
+     */
+    public record CreditHistory(LocalDate from, LocalDate to, String type, Long orgRemaining,
+                                List<CreditHistoryItem> items) {}
+
+    /**
+     * @param type    USE(사용) · CHARGE(충전)
+     * @param title   사용 = 작업 파일 이름, 충전 = 주문 내용
+     * @param pages   사용 = 차감한 쪽 수, 충전 = null
+     * @param credits 사용은 음수(−11), 충전은 양수(+3,000)
+     * @param jobId   사용일 때만
+     * @param orderId 충전일 때만
+     * @param balanceAfter 이 행 뒤의 기관 잔여(계약분) — 무소속이면 null
+     */
+    public record CreditHistoryItem(LocalDate date, String type, String title, Integer pages, long credits,
+                                    String jobId, UUID orderId, Long balanceAfter) {}
 }

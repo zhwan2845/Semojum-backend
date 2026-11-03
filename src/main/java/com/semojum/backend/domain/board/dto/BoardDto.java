@@ -18,22 +18,30 @@ public class BoardDto {
 
     public record NoticeRow(UUID noticeId, String title, String author, LocalDateTime createdAt, int viewCount) {}
 
-    /** @param author 가린 아이디(test***). 운영자 콘솔 목록에서만 원래 아이디 */
-    public record PostRow(Long postId, String title, int answerCount, String author, boolean secret,
-                          boolean hidden, LocalDateTime createdAt, int viewCount) {}
+    /**
+     * @param author 가린 아이디(test***). 운영자 콘솔 목록에서만 원래 아이디
+     * @param status WAITING(처리 중 · 대기) · ANSWERED(답변 완료) — 마지막 글이 운영자 답변이면 ANSWERED
+     */
+    public record PostRow(Long postId, String title, String category, int answerCount, String author, boolean secret,
+                          boolean hidden, LocalDateTime createdAt, int viewCount, String status) {}
 
     // ── 상세 ──
 
     /** @param mine 내가 쓴 글 — 앱이 이걸로 「수정」·「삭제」 단추를 보인다 */
-    public record PostDetail(Long postId, String title, String content, String author, boolean mine,
+    public record PostDetail(Long postId, String title, String content, String category, String author, boolean mine,
                              boolean secret, boolean hidden, LocalDateTime createdAt, LocalDateTime updatedAt,
-                             int viewCount, List<Attachment> attachments, List<Answer> answers) {}
+                             int viewCount, List<Attachment> attachments, List<Answer> answers, String status) {}
 
     /** @param url presigned URL — 15분이라 오래 들고 있지 않는다 */
     public record Attachment(Long attachmentId, String fileName, long size, String url) {}
 
     /** @param mine 내가 쓴 답변 — 운영자 콘솔이 이걸로 답변 「수정」·「삭제」를 보인다 */
-    public record Answer(Long answerId, String content, boolean mine, LocalDateTime answeredAt, LocalDateTime updatedAt) {}
+    /** @param fromAuthor 글쓴이가 이어 쓴 글(「회신」) — false면 운영자 답변. 운영자 답변과 한 줄로 쓴 순서대로 온다 */
+    public record Answer(Long answerId, String content, boolean mine, LocalDateTime answeredAt, LocalDateTime updatedAt,
+                         boolean fromAuthor) {}
+
+    /** 글쓴이 이어 묻기 */
+    public record CreateFollowUp(String content) {}
 
     public record NoticeDetail(UUID noticeId, String title, String body, String author,
                                LocalDateTime createdAt, int viewCount) {}

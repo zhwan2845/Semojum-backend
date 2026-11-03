@@ -146,6 +146,9 @@ public class ResultService {
                     .contents(new ArrayList<>(protoText.getContentsList()))
                     .drafts(draftsJson)
                     .isBlocked(protoText.getIsBlocked())
+                    .reviewFlag(protoText.getReviewFlag().isEmpty() ? null : protoText.getReviewFlag())
+                    .tableSource(protoText.getTableSource().isEmpty() ? null : protoText.getTableSource())
+                    .tableBoxLevel(protoText.getTableSource().isEmpty() ? null : protoText.getTableBoxLevel())
                     .build();
             textElementRepository.save(textElement);
 
@@ -158,9 +161,6 @@ public class ResultService {
         // 점자(braille_text_list)는 저장하지 않는다 — proto에서 삭제됐다(reserved 9).
         // AI는 교열한 묵자만 돌려주고 점역은 앱이 엔진으로 직접 한다. 그래서 새 작업의
         // braille_elements는 비어 있고 화면·SSE의 점자 배열도 빈 채로 나간다. 기존 작업의 점자는 그대로다.
-        //
-        // table_source · table_box_level(17·18)은 칼럼을 아직 만들지 않았다. 응답 전체를
-        // raw_response에 JSON으로 담고 있어 값은 버려지지 않는다 — 앱이 쓰겠다고 하면 그때 꺼낸다.
 
         // BoundingBox 저장 (mode a, c)
         for (com.semojum.backend.grpc.BoundingBox protoBbox : response.getBoundingBoxListList()) {
@@ -300,6 +300,7 @@ public class ResultService {
                 .publisher(protoRule.getPublisher().isEmpty() ? null : protoRule.getPublisher())
                 .version(protoRule.getVersion() > 0 ? protoRule.getVersion() : null)
                 .sectionPath(buildSectionPath(protoRule))
+                .axis(protoRule.getAxis().isEmpty() ? null : protoRule.getAxis())
                 .build();
     }
 
@@ -321,7 +322,8 @@ public class ResultService {
         if (value != null && !value.isEmpty()) map.put(key, value);
     }
 
-    // Drafts 변환 헬퍼: proto Draft(text/label/tn_text) → List<Map>.
+    // Drafts 변환 헬퍼: proto Draft(text/label/tn_text/option) → List<Map>.
+    // option은 안의 고정 번호(1 생략 · 2 기본 설명 · 7 줄글 …) — label은 바뀐 적이 있어 앱은 번호로 짝을 맞춘다. 0(안 줌)은 null
     // jsonb 배열로 저장되고 조회 시 그대로 배열로 응답됨(문자열 이중 인코딩 방지).
     // 점자 contents(2)는 빠졌고(reserved) 점역 태그가 든 묵자 tn_text(4)가 있다 —
     // 앱이 그 묵자로 직접 점역한다. 예전 행의 contents는 그대로 남아 있다.
@@ -333,6 +335,7 @@ public class ResultService {
             map.put("text", draft.getText());
             map.put("label", draft.getLabel());
             map.put("tn_text", draft.getTnText());
+            map.put("option", draft.getOption() > 0 ? draft.getOption() : null);
             drafts.add(map);
         }
         return drafts;

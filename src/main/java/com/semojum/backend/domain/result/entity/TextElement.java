@@ -57,6 +57,15 @@ public class TextElement {
     @Column(nullable = false)
     private boolean isBlocked;
 
+    // 줄 번호 칸 신호 — "open"(안 풀린 경고) · "sug"(고침 제안) · "note"(메모). AI가 셋 중 센 것 하나만 준다. 없으면 null
+    @Column(length = 10)
+    private String reviewFlag;
+
+    // 표 요소의 칸 글(<!표><!행><!칸> 태그 꼴)과 표를 감싼 글상자 단계(0 = 상자 밖). 표가 아니면 null
+    @Column(columnDefinition = "text")
+    private String tableSource;
+    private Integer tableBoxLevel;
+
     // 블록 삭제(soft-delete): true면 읽기 경로(buildResult)에서 제외. 행을 남겨 두어 같은 id로 되살릴 수 있다(되돌리기)
     @Column(nullable = false)
     private boolean isDeleted;
@@ -66,7 +75,8 @@ public class TextElement {
                        Integer readingOrder, Integer headingLevel, Double ocrConfidence,
                        String tnText, String latexString, Integer selectedIdx,
                        String renderMode, String visualSubtype, Double subtypeConfidence,
-                       List<String> contents, List<Map<String, Object>> drafts, boolean isBlocked) {
+                       List<String> contents, List<Map<String, Object>> drafts, boolean isBlocked,
+                       String reviewFlag, String tableSource, Integer tableBoxLevel) {
         this.pageResult = pageResult;
         this.elementId = elementId;
         this.type = type;
@@ -83,6 +93,9 @@ public class TextElement {
         this.currentContents = contents;
         this.drafts = drafts;
         this.isBlocked = isBlocked;
+        this.reviewFlag = reviewFlag;
+        this.tableSource = tableSource;
+        this.tableBoxLevel = tableBoxLevel;
     }
 
     // 점역사 수정: current만 갱신(original은 보존)

@@ -16,9 +16,7 @@ import com.semojum.backend.domain.job.scheduler.JobDispatcher;
 import com.semojum.backend.domain.job.service.JobService;
 import com.semojum.backend.domain.job.service.UploadOptionsResolver;
 import com.semojum.backend.global.hwp.HwpToPdfConverter;
-import com.semojum.backend.global.pdf.PdfPageRenderer;
 import com.semojum.backend.global.s3.S3Service;
-import com.semojum.backend.global.thumbnail.ThumbnailService;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.springframework.data.redis.core.HashOperations;
@@ -52,7 +50,7 @@ import java.nio.file.StandardCopyOption;
  * <p>실행: {@code ./gradlew test --tests '*UploadSplitBenchTest' --init-script scripts/upload-bench.gradle}
  * (init 스크립트가 테스트 JVM을 -Xmx768m로 띄우고 {@code upload.bench=true}를 넘긴다).
  *
- * <p>잰 것: {@code JobService.createJob}의 PDF 경로 전체 — 쪽 분리 + 썸네일(pdftoppm) + 쪽 PDF 생성.
+ * <p>잰 것: {@code JobService.createJob}의 PDF 경로 전체 — 쪽 분리 + 쪽 PDF 생성.
  * S3 · DB · Redis · 큐는 아무것도 기록하지 않는 스텁(stubOnly — 호출 인자를 쥐지 않는다)이라
  * 그쪽 비용과 메모리는 빠진다. 업로드 파일은 Spring처럼 디스크에 있는 MultipartFile로 흉내 낸다.
  *
@@ -125,7 +123,7 @@ class UploadSplitBenchTest {
                 start.await();
                 long t0 = System.nanoTime();
                 try {
-                    service.createJob(UUID.randomUUID().toString(), List.of(new DiskMultipartFile(pdf)), null,
+                    service.createJob(UUID.randomUUID().toString(), List.of(new DiskMultipartFile(pdf)),
                             false, null, null, null, null, null);
                 } catch (OutOfMemoryError err) {
                     synchronized (oom) { oom[0]++; }
@@ -181,7 +179,6 @@ class UploadSplitBenchTest {
 
         S3Service s3 = mock(S3Service.class, stub);
         when(s3.uploadFile(anyString(), any(), any())).thenAnswer(i -> "s3://bench/" + i.getArgument(0));
-        when(s3.getPublicUrl(anyString())).thenReturn("https://bench/thumbnail.png");
 
         @SuppressWarnings("unchecked")
         RedisTemplate<String, String> redis = mock(RedisTemplate.class, stub);
@@ -193,10 +190,8 @@ class UploadSplitBenchTest {
         when(resolver.resolve(any(), any(), any(), any()))
                 .thenReturn(new UploadOptionsResolver.Resolved(LayoutOptions.defaults(), BrailleOptions.defaults()));
 
-        ThumbnailService thumbnails = new ThumbnailService(new PdfPageRenderer("pdftoppm", 60, 85));
-
         return new JobService(jobs, mock(PageRepository.class, stub), users, s3, redis,
-                mock(JobDispatcher.class, stub), thumbnails, mock(HwpToPdfConverter.class, stub), resolver);
+                mock(JobDispatcher.class, stub), mock(HwpToPdfConverter.class, stub), resolver);
     }
 
     /** Spring이 받은 업로드처럼 디스크에 있는 파일 — getBytes는 매번 디스크에서 통째로 읽는다 */

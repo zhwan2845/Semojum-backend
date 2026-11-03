@@ -31,6 +31,9 @@ x-backend-common: &backend-common
     - ADMIN_CONSOLE_ORIGINS=${ADMIN_CONSOLE_ORIGINS:-http://203.0.113.10,https://admin.example.com}
     # HWP→PDF 변환 단계별 타임아웃(초) — .env로 재배포 없이 조정 가능
     - HWP2PDF_TIMEOUT_SECONDS=${HWP2PDF_TIMEOUT_SECONDS:-300}
+    # rhwp 실행 파일 — 문제 시 .env에 HWP2PDF_RHWP= (빈 값)을 두고 재배포하면 rhwp를 끄고 기존 변환기만 쓴다
+    # ⚠️ `:-`가 아니라 `-`다 — `:-`면 빈 값도 기본값으로 바뀌어 끌 수 없다
+    - HWP2PDF_RHWP=${HWP2PDF_RHWP-/app/rhwp}
     # 원본 미리보기 이미지 — 문제 시 PAGE_IMAGE_ENABLED=false로 즉시 PDF 방식 회귀 가능
     - PAGE_IMAGE_ENABLED=${PAGE_IMAGE_ENABLED:-true}
     - PAGE_IMAGE_DPI=${PAGE_IMAGE_DPI:-150}
@@ -42,9 +45,15 @@ x-backend-common: &backend-common
     - TZ=Asia/Seoul
     # 점자 규정 검색 데이터 — EC2 에 clone 한 Semojum/braille-reference(아래 volumes). 비공개 데이터라 이미지에 넣지 않는다
     - RULES_PATH=/app/braille-reference/rules.json
-    # -Xmx768m: 전환 창(두 색 동시 가동 ~30초)에 JVM 2개가 떠도 합계가 가용 메모리(3.7GB) 안에
-    # 갇히도록 힙 상한 고정 (기본값은 RAM 25%=960MB×2 + 네이티브라 이론상 최악에서 초과 가능)
-    - JAVA_TOOL_OPTIONS=-Duser.timezone=Asia/Seoul -Xmx768m
+    # 힙 = 컨테이너 상한(mem_limit)의 40% — 서버를 키우면 mem_limit 하나만 바꾸면 힙이 따라온다.
+    # 40%인 이유: HWP 변환 도구(rhwp · LibreOffice)가 이 컨테이너 안에서 돌아 상한에 함께 잡힌다.
+    # 3.5GB = 힙 1.4GB + JVM 기타(메타스페이스 · 스레드 · 버퍼) 약 0.4GB + 변환 예산 1.6GB(hwp2pdf.memory.budget-mb)
+    # (t3.medium 3.8GB 시절엔 -Xmx768m · 예산 1.2GB 고정이었다 — 2026-11-02 t3.large 8GB로 올림)
+    - JAVA_TOOL_OPTIONS=-Duser.timezone=Asia/Seoul -XX:MaxRAMPercentage=40
+  # 백엔드만 상한을 둔다 — 변환이 몰려도 Redis · Envoy · OS를 밀어내지 못하게.
+  # 전환 순간 두 색이 함께 떠도 2 × 3.5GB + Redis · Envoy · OS 0.5GB가 8GB(가용 7.6GB) 안이다
+  # ⚠️ 4GB 서버에선 이 값으로 띄우지 말 것 — 두 색이 겹치면 넘친다
+  mem_limit: 3500m
   depends_on:
     - redis
   volumes:

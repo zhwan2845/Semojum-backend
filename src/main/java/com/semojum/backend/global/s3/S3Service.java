@@ -28,9 +28,6 @@ public class S3Service {
     @Value("${aws.s3.bucket}")
     private String bucketName;
 
-    @Value("${aws.region}")
-    private String region;
-
     public String uploadFile(String path, byte[] fileBytes, String contentType) {
         PutObjectRequest request = PutObjectRequest.builder()
                 .bucket(bucketName)
@@ -40,12 +37,6 @@ public class S3Service {
         s3Client.putObject(request, RequestBody.fromBytes(fileBytes));
         log.info("S3 업로드 완료: {}", path);
         return "s3://" + bucketName + "/" + path;
-    }
-
-    // 저장 경로를 공개 URL로 변환 (s3://bucket/key → https://bucket.s3.region.amazonaws.com/key)
-    // 공개 읽기가 허용된 객체(썸네일)에만 쓸 것 — 원본 페이지는 getPresignedUrl 사용
-    public String getPublicUrl(String storagePath) {
-        return "https://" + bucketName + ".s3." + region + ".amazonaws.com/" + toKey(storagePath);
     }
 
     // 만료형 서명 URL 발급 — 비공개 객체(원본 쪽 PDF · 미리보기 이미지 · 첨부)를 FE가 직접 받을 때 쓴다.

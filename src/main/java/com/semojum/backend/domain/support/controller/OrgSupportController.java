@@ -41,6 +41,15 @@ public class OrgSupportController {
         return ApiResponse.success(orgSupportService.getOrderReceipt(userDetails.getUsername(), orderId));
     }
 
+    /** 견적서 내려받기 — 주문 상세 「견적서 내려받기」. 자기 기관 주문만, presigned URL 15분 */
+    @GetMapping("/orders/{orderId}/quote")
+    public ApiResponse<SupportDto.ReceiptDownload> getOrderQuote(
+            @AuthenticationPrincipal UserDetails userDetails,
+            @PathVariable UUID orderId
+    ) {
+        return ApiResponse.success(orgSupportService.getOrderQuote(userDetails.getUsername(), orderId));
+    }
+
     /** 증빙(계산서) 받는 사람 변경 — null·빈 문자열 = 제거 */
     @PatchMapping("/receipt-email")
     public ApiResponse<Void> updateReceiptEmail(

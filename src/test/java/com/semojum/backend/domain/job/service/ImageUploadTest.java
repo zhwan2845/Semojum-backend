@@ -10,7 +10,6 @@ import com.semojum.backend.global.exception.CustomException;
 import com.semojum.backend.global.exception.ErrorCode;
 import com.semojum.backend.global.hwp.HwpToPdfConverter;
 import com.semojum.backend.global.s3.S3Service;
-import com.semojum.backend.global.thumbnail.ThumbnailService;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
@@ -105,6 +104,17 @@ class ImageUploadTest {
         assertEquals(ErrorCode.COMMON_BAD_REQUEST, e.getErrorCode());
     }
 
+    /** 이미지 여러 장은 합계 100MB까지 — 요청 한도 105MB까지 받던 것을 파일 하나의 상한에 맞춘다 */
+    @Test
+    void 이미지_합계가_100MB를_넘으면_JOB4009다() {
+        long mb = 1024L * 1024;
+        JobService.validateTotalSize(List.of(50 * mb, 50 * mb));   // 정확히 100MB는 받는다
+
+        CustomException e = assertThrows(CustomException.class,
+                () -> JobService.validateTotalSize(List.of(50 * mb, 50 * mb, 1L)));
+        assertEquals(ErrorCode.JOB_FILE_TOO_LARGE, e.getErrorCode());
+    }
+
     // ── 쪽 생성 ──────────────────────────────────────────────────
 
     @Test
@@ -125,7 +135,7 @@ class ImageUploadTest {
 
         JobService service = new JobService(
                 Mockito.mock(JobRepository.class), pageRepository, userRepository, s3Service,
-                redisTemplate, dispatcher, Mockito.mock(ThumbnailService.class),
+                redisTemplate, dispatcher,
                 Mockito.mock(HwpToPdfConverter.class),
                 new UploadOptionsResolver(
                         Mockito.mock(BrailleFormRepository.class),
@@ -136,7 +146,7 @@ class ImageUploadTest {
                 image("3-표지.png", 30), image("1-본문.jpg", 10), image("2-본문.jpeg", 20));
 
         var created = service.createJob(UUID.randomUUID().toString(), files,
-                null, false, null, null, null, null, null);
+                false, null, null, null, null, null);
 
         assertEquals("c", created.mode());
         assertEquals(3, created.totalPages());
@@ -183,13 +193,13 @@ class ImageUploadTest {
         JobService service = new JobService(
                 Mockito.mock(JobRepository.class), Mockito.mock(PageRepository.class),
                 userRepository, s3Service, redisTemplate, Mockito.mock(JobDispatcher.class),
-                Mockito.mock(ThumbnailService.class), Mockito.mock(HwpToPdfConverter.class),
+                Mockito.mock(HwpToPdfConverter.class),
                 new UploadOptionsResolver(
                         Mockito.mock(BrailleFormRepository.class),
                         builtinForms()));
 
         service.createJob(UUID.randomUUID().toString(),
-                List.of(image("a.png"), image("b.jpg")), null, false, null, null, null, null, null);
+                List.of(image("a.png"), image("b.jpg")), false, null, null, null, null, null);
 
         ArgumentCaptor<String> keys = ArgumentCaptor.forClass(String.class);
         ArgumentCaptor<String> types = ArgumentCaptor.forClass(String.class);

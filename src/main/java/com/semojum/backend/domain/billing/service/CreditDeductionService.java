@@ -60,6 +60,7 @@ public class CreditDeductionService {
                 .build());
         // 스케줄러가 기억해 둔 잔여 크레딧을 커밋 뒤에 버린다 — 다음 쪽을 보낼지 새 값으로 정하게
         creditBalanceService.evict(orgId);
+        creditBalanceService.evictAccount(user.getId());
         if (couponId != null) {
             log.info("쿠폰 차감: jobId={}, pageNo={}, couponId={}, amount={}", jobId, pageNo, couponId, credit);
         }

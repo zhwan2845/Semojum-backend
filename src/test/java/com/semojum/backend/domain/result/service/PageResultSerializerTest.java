@@ -1,5 +1,6 @@
 package com.semojum.backend.domain.result.service;
 
+import com.semojum.backend.domain.result.entity.RuleTrail;
 import com.semojum.backend.domain.result.entity.*;
 import com.semojum.backend.domain.result.repository.*;
 import org.junit.jupiter.api.BeforeEach;
@@ -226,5 +227,33 @@ class PageResultSerializerTest {
         serializer.buildResult(pageResult("a"));
 
         verify(ruleRepo, never()).findByElementIdIn(anyCollection());
+    }
+
+    /** proto 협의판(2026-11-01) — 줄 번호 칸 신호 · 표 칸 글 · 규정 좌표 기준을 앱에 그대로 넘긴다 */
+    @Test
+    @SuppressWarnings("unchecked")
+    void 검토_신호와_표_칸_글과_규정_좌표_기준을_싣는다() {
+        TextElement table = TextElement.builder().elementId("el-1").type("table").readingOrder(1)
+                .contents(List.of("표")).reviewFlag("sug").tableSource("<!표><!행><!칸>가").tableBoxLevel(1).build();
+        org.springframework.test.util.ReflectionTestUtils.setField(table, "id", java.util.UUID.randomUUID());
+        TextElement plain = TextElement.builder().elementId("el-2").type("text").readingOrder(2)
+                .contents(List.of("본문")).build();
+        org.springframework.test.util.ReflectionTestUtils.setField(plain, "id", java.util.UUID.randomUUID());
+        when(textRepo.findByPageResult(any())).thenReturn(List.of(table, plain));
+        when(ruleRepo.findByElementIdIn(any())).thenReturn(List.of(
+                RuleTrail.builder().elementId(table.getId()).elementType("TEXT").ruleId("r1").section("s")
+                        .title("t").excerpt("e").colStart(0).colEnd(3).build(),
+                RuleTrail.builder().elementId(plain.getId()).elementType("TEXT").ruleId("r2").section("s")
+                        .title("t").excerpt("e").colStart(0).colEnd(2).axis("print").build()));
+
+        List<Map<String, Object>> list = (List<Map<String, Object>>) serializer.buildResult(pageResult("c")).get("text_list");
+
+        assertEquals("sug", list.get(0).get("review_flag"));
+        assertEquals("<!표><!행><!칸>가", list.get(0).get("table_source"));
+        assertEquals(1, list.get(0).get("table_box_level"));
+        assertNull(list.get(1).get("review_flag"), "신호가 없으면 null");
+        // 예전 행은 axis가 저장돼 있지 않다 — AI 응답 좌표라 묵자(print)로 낸다
+        assertEquals("print", ((List<Map<String, Object>>) list.get(0).get("rule_trail")).get(0).get("axis"));
+        assertEquals("print", ((List<Map<String, Object>>) list.get(1).get("rule_trail")).get(0).get("axis"));
     }
 }

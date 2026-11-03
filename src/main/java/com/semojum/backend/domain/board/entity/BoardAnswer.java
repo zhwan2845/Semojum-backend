@@ -29,6 +29,10 @@ public class BoardAnswer {
     @Column(nullable = false, columnDefinition = "text")
     private String content;
 
+    // 글쓴이가 이어 쓴 글(「회신」) — false면 운영자 답변. 답변 수 · 처리 상태는 운영자 답변만 센다
+    @Column(name = "from_author", nullable = false)
+    private boolean fromAuthor;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private LocalDateTime createdAt;
 
@@ -36,10 +40,11 @@ public class BoardAnswer {
     private LocalDateTime updatedAt;
 
     @Builder
-    public BoardAnswer(Long postId, UUID userId, String content) {
+    public BoardAnswer(Long postId, UUID userId, String content, boolean fromAuthor) {
         this.postId = postId;
         this.userId = userId;
         this.content = content;
+        this.fromAuthor = fromAuthor;
         this.createdAt = LocalDateTime.now();
         this.updatedAt = this.createdAt;
     }

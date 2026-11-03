@@ -62,10 +62,25 @@ public class Order {
     @Column(name = "receipt_uploaded_at")
     private Instant receiptUploadedAt;
 
+    // 이 주문을 만든 기관 요청(크레딧 추가) — 주문 상세 「요청한 사람 · 요청한 날」. 요청 없이 만든 주문은 null
+    @Column(name = "request_id", columnDefinition = "uuid")
+    private UUID requestId;
+
+    // 견적서 — 운영자가 올린다(재업로드 = 교체). 주문 상세 「견적서 내려받기」
+    @Column(name = "quote_file_key", length = 300)
+    private String quoteFileKey;
+
+    @Column(name = "quote_file_name", length = 200)
+    private String quoteFileName;
+
+    @Column(name = "quote_uploaded_at")
+    private Instant quoteUploadedAt;
+
     @Builder
     public Order(UUID organizationId, LocalDate orderDate, String description,
-                 long amountKrw, Long creditAmount) {
+                 long amountKrw, Long creditAmount, UUID requestId) {
         this.organizationId = organizationId;
+        this.requestId = requestId;
         this.orderDate = orderDate;
         this.description = description;
         this.amountKrw = amountKrw;
@@ -85,5 +100,11 @@ public class Order {
         this.receiptFileKey = fileKey;
         this.receiptFileName = fileName;
         this.receiptUploadedAt = Instant.now();
+    }
+
+    public void attachQuote(String fileKey, String fileName) {
+        this.quoteFileKey = fileKey;
+        this.quoteFileName = fileName;
+        this.quoteUploadedAt = Instant.now();
     }
 }

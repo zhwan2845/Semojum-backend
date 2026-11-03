@@ -105,6 +105,10 @@ public class PageResultSerializer {
             // AI 가 준 요소 추출 신뢰도(0~1). AI 가 0 을 보내면 저장하지 않아 null — 「값 없음」과 「낮음」을 가른다.
             // ⚠️ 실측: 0.95 · 1.00 두 값뿐이다 — 측정값인지 AI 팀 확인 전이다
             map.put("ocr_confidence", round3(el.getOcrConfidence()));
+            // 줄 번호 칸 신호 "open" · "sug" · "note" — 없으면 null. 표 요소는 칸 글과 글상자 단계
+            map.put("review_flag", el.getReviewFlag());
+            map.put("table_source", el.getTableSource());
+            map.put("table_box_level", el.getTableBoxLevel());
             list.add(map);
         }
         return list;
@@ -201,6 +205,8 @@ public class PageResultSerializer {
         map.put("publisher", rt.getPublisher());
         map.put("version", rt.getVersion());
         map.put("path", rt.getSectionPath());
+        // col_* 를 센 글 — 예전 행은 저장된 값이 없어도 AI 응답 좌표라 늘 묵자다
+        map.put("axis", rt.getAxis() == null ? "print" : rt.getAxis());
         return map;
     }
 

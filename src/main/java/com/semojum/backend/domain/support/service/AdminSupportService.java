@@ -60,6 +60,7 @@ public class AdminSupportService {
     // ── 공지 ──
     @Transactional
     public SupportDto.NoticeItem createNotice(SupportDto.CreateNotice request) {
+        validateNoticeCategory(request.category());
         if (request.endsOn().isBefore(request.startsOn())) {
             log.warn("공지 기간 역전: startsOn={}, endsOn={}", request.startsOn(), request.endsOn());
             throw new CustomException(ErrorCode.COMMON_BAD_REQUEST);
@@ -73,6 +74,7 @@ public class AdminSupportService {
                 .targetOrganizationId(request.targetOrganizationId())
                 .title(request.title())
                 .body(request.body())
+                .category(request.category())
                 .startsOn(request.startsOn())
                 .endsOn(request.endsOn())
                 .build());
@@ -84,6 +86,7 @@ public class AdminSupportService {
     /** 공지 수정 — 등록과 같은 검증. 게시판 조회수는 그대로 둔다 */
     @Transactional
     public SupportDto.NoticeItem updateNotice(UUID noticeId, SupportDto.CreateNotice request) {
+        validateNoticeCategory(request.category());
         if (request.endsOn().isBefore(request.startsOn())) throw new CustomException(ErrorCode.COMMON_BAD_REQUEST);
         Notice notice = noticeRepository.findById(noticeId)
                 .orElseThrow(() -> new CustomException(ErrorCode.BOARD_NOTICE_NOT_FOUND));
@@ -92,7 +95,7 @@ public class AdminSupportService {
             orgName = organizationRepository.findById(request.targetOrganizationId())
                     .orElseThrow(() -> new CustomException(ErrorCode.ORG_NOT_FOUND)).getName();
         }
-        notice.update(request.targetOrganizationId(), request.title(), request.body(),
+        notice.update(request.targetOrganizationId(), request.title(), request.body(), request.category(),
                 request.startsOn(), request.endsOn());
         log.info("공지 수정: noticeId={}", noticeId);
         return toNoticeItem(notice, orgName);
@@ -136,7 +139,15 @@ public class AdminSupportService {
         String displayStatus = today.isBefore(n.getStartsOn()) ? "SCHEDULED"
                 : today.isAfter(n.getEndsOn()) ? "ENDED" : "ACTIVE";
         return new SupportDto.NoticeItem(n.getId(), n.getTargetOrganizationId(), orgName,
-                n.getTitle(), n.getBody(), n.getStartsOn(), n.getEndsOn(), displayStatus, n.getCreatedAt(), n.isPinned());
+                n.getTitle(), n.getBody(), n.getStartsOn(), n.getEndsOn(), displayStatus, n.getCreatedAt(), n.isPinned(),
+                n.getCategory());
+    }
+
+    private static void validateNoticeCategory(String category) {
+        if (category != null && !Notice.CATEGORIES.contains(category)) {
+            log.warn("공지 분류 오류: {}", category);
+            throw new CustomException(ErrorCode.COMMON_BAD_REQUEST);
+        }
     }
 
     // ── 문의 ──
@@ -171,7 +182,8 @@ public class AdminSupportService {
                 i.getUserId() == null ? null : loginIds.get(i.getUserId()),
                 i.getSenderEmail(), i.getSubject(),
                 preview(i.getMessage()), i.getCreatedAt(), i.getStatusChangedAt(),
-                attachments.getOrDefault(i.getId(), List.of()).size())).toList();
+                attachments.getOrDefault(i.getId(), List.of()).size(),
+                i.getSenderName(), i.getSenderOrgName())).toList();
         return new SupportDto.InquiryPage(items, result.getNumber(), result.getSize(),
                 result.getTotalElements(), result.getTotalPages());
     }
@@ -221,7 +233,7 @@ public class AdminSupportService {
         return new SupportDto.InquiryDetail(inquiry.getId(), inquiry.getType(), inquiry.getStatus(),
                 orgName, loginId, inquiry.getSenderEmail(), inquiry.getSubject(),
                 inquiry.getMessage(), inquiry.getCreatedAt(), inquiry.getStatusChangedAt(),
-                inlineImages, files);
+                inlineImages, files, inquiry.getSenderName(), inquiry.getSenderOrgName(), inquiry.getRequestDetails());
     }
 
     private Map<UUID, List<InquiryAttachment>> attachmentRowsFor(List<UUID> inquiryIds) {
@@ -240,12 +252,14 @@ public class AdminSupportService {
     public SupportDto.OrderItem createOrder(SupportDto.CreateOrder request) {
         Organization org = organizationRepository.findById(request.organizationId())
                 .orElseThrow(() -> new CustomException(ErrorCode.ORG_NOT_FOUND));
+        if (request.requestId() != null) validateOrderRequest(request.requestId(), org.getId());
         Order saved = orderRepository.save(Order.builder()
                 .organizationId(request.organizationId())
                 .orderDate(request.orderDate())
                 .description(request.description())
                 .amountKrw(request.amountKrw())
                 .creditAmount(request.creditAmount())
+                .requestId(request.requestId())
                 .build());
         log.info("주문 기록: id={}, org={}, 금액={}원", saved.getId(), org.getCode(), request.amountKrw());
         return toOrderItem(orderRepository.findById(saved.getId()).orElse(saved), org.getName());
@@ -289,31 +303,71 @@ public class AdminSupportService {
         Order order = orderRepository.findById(orderId)
                 .orElseThrow(() -> new CustomException(ErrorCode.COMMON_NOT_FOUND));
         String name = file.getOriginalFilename();
-        String ext = name != null && name.contains(".")
-                ? name.substring(name.lastIndexOf('.') + 1).toLowerCase() : "";
-        if (!RECEIPT_EXTS.contains(ext)) {
-            log.warn("증빙 파일 형식 오류: {}", name);
-            throw new CustomException(ErrorCode.COMMON_BAD_REQUEST);
-        }
-        if (file.getSize() > RECEIPT_MAX_BYTES) {
-            log.warn("증빙 파일 크기 초과: {} ({}KB)", name, file.getSize() / 1024);
-            throw new CustomException(ErrorCode.COMMON_BAD_REQUEST);
-        }
-        try {
-            // 교체 의미 — 기존 파일을 지우고 새 파일 하나만 유지
-            s3Service.deleteByPrefix("receipts/" + orderId + "/");
-            String key = "receipts/" + orderId + "/receipt." + ext;
-            String contentType = ext.equals("pdf") ? "application/pdf" : "image/" + (ext.equals("jpg") ? "jpeg" : ext);
-            s3Service.uploadFile(key, file.getBytes(), contentType);
-            order.attachReceipt(key, name);
-        } catch (IOException e) {
-            log.error("증빙 파일 업로드 실패: order={}", orderId, e);
-            throw new CustomException(ErrorCode.COMMON_INTERNAL_ERROR);
-        }
+        String key = storeOrderFile(orderId, file, "receipts", "receipt");
+        order.attachReceipt(key, name);
         log.info("증빙 업로드: order={}, file={}", orderId, name);
         String orgName = organizationRepository.findById(order.getOrganizationId())
                 .map(Organization::getName).orElse(null);
         return toOrderItem(order, orgName);
+    }
+
+    /** 견적서 업로드 — 증빙과 같은 형식 · 크기 제한, 재업로드 = 교체. 기관 관리자 주문 상세 「견적서 내려받기」 */
+    @Transactional
+    public SupportDto.OrderItem uploadOrderQuote(UUID orderId, MultipartFile file) {
+        Order order = orderRepository.findById(orderId)
+                .orElseThrow(() -> new CustomException(ErrorCode.COMMON_NOT_FOUND));
+        String name = file.getOriginalFilename();
+        String key = storeOrderFile(orderId, file, "quotes", "quote");
+        order.attachQuote(key, name);
+        log.info("견적서 업로드: order={}, file={}", orderId, name);
+        String orgName = organizationRepository.findById(order.getOrganizationId())
+                .map(Organization::getName).orElse(null);
+        return toOrderItem(order, orgName);
+    }
+
+    @Transactional(readOnly = true)
+    public SupportDto.ReceiptDownload getOrderQuote(UUID orderId) {
+        Order order = orderRepository.findById(orderId)
+                .orElseThrow(() -> new CustomException(ErrorCode.COMMON_NOT_FOUND));
+        if (order.getQuoteFileKey() == null) throw new CustomException(ErrorCode.COMMON_NOT_FOUND);
+        return new SupportDto.ReceiptDownload(order.getQuoteFileName(),
+                s3Service.getPresignedUrl(order.getQuoteFileKey(), Duration.ofMinutes(15)));
+    }
+
+    /** 주문 파일 하나를 {@code {folder}/{orderId}/{baseName}.{ext}}에 둔다 — 기존 파일은 지운다(교체). 저장한 키를 돌려준다 */
+    private String storeOrderFile(UUID orderId, MultipartFile file, String folder, String baseName) {
+        String name = file.getOriginalFilename();
+        String ext = name != null && name.contains(".")
+                ? name.substring(name.lastIndexOf('.') + 1).toLowerCase() : "";
+        if (!RECEIPT_EXTS.contains(ext)) {
+            log.warn("주문 파일 형식 오류: {}", name);
+            throw new CustomException(ErrorCode.COMMON_BAD_REQUEST);
+        }
+        if (file.getSize() > RECEIPT_MAX_BYTES) {
+            log.warn("주문 파일 크기 초과: {} ({}KB)", name, file.getSize() / 1024);
+            throw new CustomException(ErrorCode.COMMON_BAD_REQUEST);
+        }
+        try {
+            // 교체 의미 — 기존 파일을 지우고 새 파일 하나만 유지
+            s3Service.deleteByPrefix(folder + "/" + orderId + "/");
+            String key = folder + "/" + orderId + "/" + baseName + "." + ext;
+            String contentType = ext.equals("pdf") ? "application/pdf" : "image/" + (ext.equals("jpg") ? "jpeg" : ext);
+            s3Service.uploadFile(key, file.getBytes(), contentType);
+            return key;
+        } catch (IOException e) {
+            log.error("주문 파일 업로드 실패: order={}, folder={}", orderId, folder, e);
+            throw new CustomException(ErrorCode.COMMON_INTERNAL_ERROR);
+        }
+    }
+
+    /** 주문에 잇는 요청은 같은 기관의 크레딧 추가 요청이어야 한다 — 아니면 400 */
+    private void validateOrderRequest(UUID requestId, UUID organizationId) {
+        Inquiry request = inquiryRepository.findById(requestId).orElse(null);
+        if (request == null || !organizationId.equals(request.getOrganizationId())
+                || !Inquiry.TYPE_CREDIT_ADD.equals(request.getType())) {
+            log.warn("주문에 이을 수 없는 요청: requestId={}, org={}", requestId, organizationId);
+            throw new CustomException(ErrorCode.COMMON_BAD_REQUEST);
+        }
     }
 
     @Transactional(readOnly = true)
@@ -330,7 +384,7 @@ public class AdminSupportService {
     private SupportDto.OrderItem toOrderItem(Order o, String orgName) {
         return new SupportDto.OrderItem(o.getId(), o.getOrganizationId(), orgName, o.getOrderDate(),
                 o.getDescription(), o.getAmountKrw(), o.getCreditAmount(), o.getPaidAt(),
-                o.getInvoiceStatus(), o.getReceiptFileName(), o.getCreatedAt());
+                o.getInvoiceStatus(), o.getReceiptFileName(), o.getCreatedAt(), o.getRequestId(), o.getQuoteFileName());
     }
 
     private Map<UUID, String> orgNameMap() {

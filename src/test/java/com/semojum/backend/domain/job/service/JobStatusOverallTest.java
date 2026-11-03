@@ -13,6 +13,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.when;
@@ -41,6 +42,8 @@ class JobStatusOverallTest {
     JobStatusService jobStatusService;
     HashOperations<String, Object, Object> hashOps;
 
+    ConversionEtaEstimator eta;
+
     @BeforeEach
     @SuppressWarnings("unchecked")
     void setUp() {
@@ -56,6 +59,9 @@ class JobStatusOverallTest {
         ReflectionTestUtils.setField(jobStatusService, "jobRepository", jobRepository);
         pageRepository = Mockito.mock(PageRepository.class);
         ReflectionTestUtils.setField(jobStatusService, "pageRepository", pageRepository);
+        eta = Mockito.mock(ConversionEtaEstimator.class);
+        Mockito.when(eta.remainingSeconds(Mockito.anyString(), Mockito.anyInt())).thenReturn(42);
+        ReflectionTestUtils.setField(jobStatusService, "conversionEtaEstimator", eta);
         when(jobRepository.findByIdAndUserId(eq("job-1"), eq(UUID.fromString(OWNER))))
                 .thenReturn(Optional.of(Job.builder()
                         .id("job-1").mode("c").totalPages(3).originalFileName("a.pdf").build()));
@@ -200,5 +206,13 @@ class JobStatusOverallTest {
         when(pageRepository.findByJob(job)).thenReturn(List.of(p1));
 
         assertEquals("COMPLETED", jobStatusService.getJobStatus(OWNER, "job-1").overallStatus());
+    }
+
+    /** 진행 중이면 남은 쪽(대기 + 처리 중)으로 잔여 시간을 싣고, 끝났으면 null */
+    @Test
+    void 진행_중이면_잔여_시간을_싣고_끝나면_null이다() {
+        assertEquals(42, statusOf("COMPLETED", "RUNNING", "PENDING").estimatedRemainingSec());
+        Mockito.verify(eta).remainingSeconds("job-1", 2);
+        assertNull(statusOf("COMPLETED", "BLOCKED").estimatedRemainingSec());
     }
 }

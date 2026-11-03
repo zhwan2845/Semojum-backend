@@ -61,12 +61,16 @@ public class RuleTrail {
     @Column(name = "section_path", columnDefinition = "jsonb")
     private Map<String, String> sectionPath;
 
+    // col_start · col_end를 센 글 — "print"(묵자 글자, AI 응답은 늘 이것) · "braille"(점자 칸). 예전 행은 null(= print)
+    @Column(length = 10)
+    private String axis;
+
     @Builder
     public RuleTrail(UUID elementId, String elementType, String ruleId,
                      String source, String priority,
                      String section, String title, String excerpt,
                      Integer lineNo, Integer colStart, Integer colEnd, String tag,
-                     String publisher, Integer version, Map<String, String> sectionPath) {
+                     String publisher, Integer version, Map<String, String> sectionPath, String axis) {
         this.elementId = elementId;
         this.elementType = elementType;
         this.ruleId = ruleId;
@@ -82,5 +86,6 @@ public class RuleTrail {
         this.publisher = publisher;
         this.version = version;
         this.sectionPath = sectionPath;
+        this.axis = axis;
     }
 }

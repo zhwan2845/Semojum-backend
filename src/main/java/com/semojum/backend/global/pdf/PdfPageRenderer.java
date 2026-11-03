@@ -70,7 +70,7 @@ public class PdfPageRenderer {
 
     /**
      * 디스크에 있는 PDF의 첫 쪽을 렌더한다 — pdftoppm에 경로를 그대로 넘겨 JVM 힙에 원본을 올리지 않는다.
-     * 업로드 썸네일처럼 큰 원본(최대 100MB)을 다룰 때 쓴다. 파일은 호출부 소유라 지우지 않는다.
+     * 파일은 호출부 소유라 지우지 않는다.
      */
     public byte[] renderFirstPage(Path pdf, Format format, int dpi) throws IOException, InterruptedException {
         Path dir = Files.createTempDirectory("pdfrender-");

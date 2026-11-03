@@ -59,8 +59,8 @@ class AdminAccessGuardCoverageTest {
                 checked.add(type.getSimpleName() + "#" + m.getName());
             }
         }
-        // 운영자 API 42개 — 핸들러를 못 찾아 아무것도 검사하지 않고 통과하는 일을 막는다
-        assertEquals(42, checked.size(), checked.toString());
+        // 운영자 API 44개 — 핸들러를 못 찾아 아무것도 검사하지 않고 통과하는 일을 막는다
+        assertEquals(44, checked.size(), checked.toString());
     }
 
     private static Object defaultValue(Class<?> type) {

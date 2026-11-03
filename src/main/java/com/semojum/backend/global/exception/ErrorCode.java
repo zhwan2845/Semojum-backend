@@ -17,7 +17,7 @@ public enum ErrorCode {
 
     // ========== 인증 (AUTH) ==========
     AUTH_INVALID_CREDENTIALS(HttpStatus.UNAUTHORIZED, "AUTH4001", "아이디 또는 비밀번호가 올바르지 않습니다."),
-    AUTH_DUPLICATE_LOGIN_ID(HttpStatus.CONFLICT, "AUTH4002", "이미 사용 중인 로그인 ID입니다."),
+    // AUTH4002(로그인 ID 중복)는 ID를 서버가 기관 코드 + 순번으로 지어 나올 수 없어 지웠다 — 번호를 다시 쓰지 않는다
     AUTH_INVALID_TOKEN(HttpStatus.UNAUTHORIZED, "AUTH4003", "액세스 토큰이 만료되었거나 유효하지 않습니다."),
     AUTH_WRONG_CHANNEL(HttpStatus.FORBIDDEN, "AUTH4005", "이 환경에서는 로그인할 수 없는 계정입니다."),
     // 로그인 5회 실패 → 10분 잠금 — result.unlockAt에 해제 시각
@@ -33,16 +33,17 @@ public enum ErrorCode {
 
     // ========== 작업 (JOB) ==========
     JOB_NOT_FOUND(HttpStatus.NOT_FOUND, "JOB4001", "존재하지 않는 작업입니다."),
-    JOB_INVALID_FILE(HttpStatus.BAD_REQUEST, "JOB4002", "PDF·HWP·HWPX·TXT 파일만 업로드 가능합니다."),
-    JOB_INVALID_MODE(HttpStatus.BAD_REQUEST, "JOB4003", "지원하지 않는 모드입니다."),
+    JOB_INVALID_FILE(HttpStatus.BAD_REQUEST, "JOB4002", "PDF·HWP·HWPX·TXT·이미지(JPG·PNG) 파일만 올릴 수 있습니다."),
+    // JOB4003(모드)은 mode 파라미터와 함께 폐기 — 번호를 다시 쓰지 않는다
     ELEMENT_NOT_FOUND(HttpStatus.NOT_FOUND, "JOB4004", "존재하지 않는 요소입니다."),
     // JOB4005(elementType 검증)는 폐기 — 번호를 다시 쓰지 않는다
     ELEMENT_LIST_MISMATCH(HttpStatus.BAD_REQUEST, "JOB4006", "요소 목록이 현재 페이지의 요소와 일치하지 않습니다."),
     JOB_HWP_PARSE_FAILED(HttpStatus.BAD_REQUEST, "JOB4007", "HWP 파일을 읽을 수 없습니다. 파일이 손상되었거나 지원하지 않는 형식입니다."),
     JOB_HWP_UNSUPPORTED(HttpStatus.BAD_REQUEST, "JOB4008", "암호가 설정되었거나 배포용으로 저장된 HWP 파일은 변환할 수 없습니다."),
     JOB_FILE_TOO_LARGE(HttpStatus.PAYLOAD_TOO_LARGE, "JOB4009", "업로드 가능한 파일 최대 용량(100MB)을 초과했습니다."),
-    JOB_IN_PROGRESS(HttpStatus.CONFLICT, "JOB4010", "변환 중인 작업은 이동·이름변경·삭제·다운로드할 수 없습니다."),
+    JOB_IN_PROGRESS(HttpStatus.CONFLICT, "JOB4010", "변환 중인 작업입니다. 변환이 끝난 뒤 다시 시도해 주세요."),
     // JOB4011(점역 문서 덮어쓰기 확인)은 쓰인 적이 없어 지웠다 — 번호를 다시 쓰지 않는다
+    // JOB4012(다운로드)는 다운로드 API와 함께 폐기 — 번호를 다시 쓰지 않는다
     JOB_HWP_CONVERT_FAILED(HttpStatus.BAD_REQUEST, "JOB4013", "HWP를 PDF로 변환하지 못했습니다. 파일을 확인해 주세요."),
     // 이어서 처리 — 크레딧 소진으로 멈춘 쪽 재개
     JOB_NOTHING_TO_RESUME(HttpStatus.CONFLICT, "JOB4014", "이어서 처리할 쪽이 없습니다."),
@@ -50,6 +51,11 @@ public enum ErrorCode {
     JOB_COPY_NOT_RESUMABLE(HttpStatus.BAD_REQUEST, "JOB4015", "받은 파일로 만든 사본에서는 변환을 다시 돌릴 수 없습니다. 원래 작업에서 해 주세요."),
     // 실패한 쪽 다시 변환
     JOB_NOTHING_TO_RETRY(HttpStatus.CONFLICT, "JOB4016", "다시 변환할 실패한 쪽이 없습니다."),
+    // HWP 변환 메모리 예산이 정한 시간 안에 비지 않았다 — 서버를 지키려고 거절한다
+    JOB_CONVERT_BUSY(HttpStatus.TOO_MANY_REQUESTS, "JOB4017", "지금 변환 요청이 몰려 있습니다. 잠시 후 다시 시도해 주세요."),
+    // 암호 PDF — 앱이 문서 암호 입력 창(Case 3)을 띄우고 password를 붙여 다시 올린다. 서버는 암호를 저장하지 않는다
+    JOB_PDF_PASSWORD_REQUIRED(HttpStatus.BAD_REQUEST, "JOB4018", "암호가 걸린 PDF입니다. 문서 암호를 입력해 주세요."),
+    JOB_PDF_PASSWORD_WRONG(HttpStatus.BAD_REQUEST, "JOB4019", "문서 암호가 맞지 않습니다."),
 
     // ========== 크레딧 (CREDIT) ==========
     CREDIT_INSUFFICIENT(HttpStatus.PAYMENT_REQUIRED, "CREDIT4001", "잔여 크레딧이 없습니다. 크레딧을 충전한 뒤 다시 시도해 주세요."),
@@ -61,7 +67,11 @@ public enum ErrorCode {
     BOARD_NOTICE_NOT_FOUND(HttpStatus.NOT_FOUND, "BOARD4002", "존재하지 않는 공지입니다."),
     BOARD_ANSWER_NOT_FOUND(HttpStatus.NOT_FOUND, "BOARD4003", "존재하지 않는 답변입니다."),
     BOARD_ATTACHMENT_INVALID(HttpStatus.BAD_REQUEST, "BOARD4004", "첨부할 수 없는 파일입니다. 최대 5개, 이미지·문서·zip만 올릴 수 있습니다."),
-    BOARD_ATTACHMENT_TOO_LARGE(HttpStatus.PAYLOAD_TOO_LARGE, "BOARD4130", "첨부 파일은 한 개에 10MB까지 올릴 수 있습니다.");
+    BOARD_ATTACHMENT_TOO_LARGE(HttpStatus.PAYLOAD_TOO_LARGE, "BOARD4130", "첨부 파일은 한 개에 10MB까지 올릴 수 있습니다."),
+
+    // ── 공개 문의 ──
+    INQUIRY_ATTACHMENT_INVALID(HttpStatus.BAD_REQUEST, "INQUIRY4001", "첨부할 수 없는 파일입니다. 최대 3개, 이미지·문서·zip만 올릴 수 있습니다."),
+    INQUIRY_ATTACHMENT_TOO_LARGE(HttpStatus.PAYLOAD_TOO_LARGE, "INQUIRY4130", "첨부 파일은 한 개에 10MB까지 올릴 수 있습니다.");
 
     private final HttpStatus httpStatus;
     private final String code;

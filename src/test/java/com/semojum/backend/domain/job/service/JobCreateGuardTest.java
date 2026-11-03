@@ -10,7 +10,6 @@ import com.semojum.backend.global.exception.CustomException;
 import com.semojum.backend.global.exception.ErrorCode;
 import com.semojum.backend.global.hwp.HwpToPdfConverter;
 import com.semojum.backend.global.s3.S3Service;
-import com.semojum.backend.global.thumbnail.ThumbnailService;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -38,7 +37,7 @@ class JobCreateGuardTest {
                 Mockito.mock(JobRepository.class), Mockito.mock(PageRepository.class),
                 userRepository, Mockito.mock(S3Service.class),
                 Mockito.mock(RedisTemplate.class), Mockito.mock(JobDispatcher.class),
-                Mockito.mock(ThumbnailService.class), Mockito.mock(HwpToPdfConverter.class),
+                Mockito.mock(HwpToPdfConverter.class),
                 new UploadOptionsResolver(
                         Mockito.mock(BrailleFormRepository.class),
                         builtinForms()));
@@ -49,7 +48,7 @@ class JobCreateGuardTest {
 
         MockMultipartFile file = new MockMultipartFile("file", "sample.pdf", "application/pdf", new byte[]{1});
         CustomException e = assertThrows(CustomException.class, () ->
-                service.createJob(UUID.randomUUID().toString(), List.of(file), "a", false, null, null, null, null, null));
+                service.createJob(UUID.randomUUID().toString(), List.of(file), false, null, null, null, null, null));
         assertEquals(ErrorCode.COMMON_FORBIDDEN, e.getErrorCode());
     }
     /** 기본 양식은 클래스패스에서 읽는다 — 양식을 안 고르는 경로라도 리졸버가 필요하다 */

@@ -15,5 +15,6 @@ grpc:
 
 hwp2pdf:
   script: ${HWP2PDF_SCRIPT:/app/hwp2odt.py}   # Dockerfile 이 이미지에 넣는 위치
+  rhwp: ${HWP2PDF_RHWP:/app/rhwp}             # 〃 — 비우면 rhwp 없이 기존 변환기만 쓴다
 
 # 점자 규정 경로(rules.path)는 여기 두지 않는다 — compose 의 RULES_PATH 가 볼륨 연결과 한 곳에서 짝을 이룬다

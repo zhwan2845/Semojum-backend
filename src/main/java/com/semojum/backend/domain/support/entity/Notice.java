@@ -8,6 +8,7 @@ import lombok.NoArgsConstructor;
 
 import java.time.Instant;
 import java.time.LocalDate;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -34,6 +35,12 @@ public class Notice {
     @Column(nullable = false, columnDefinition = "text")
     private String body;
 
+    public static final Set<String> CATEGORIES = Set.of("MAINTENANCE", "RELEASE", "MATERIAL");
+
+    // 분류 — MAINTENANCE(점검) · RELEASE(새 판) · MATERIAL(자료). null = 분류 없음(「전체」 탭에만)
+    @Column(length = 20)
+    private String category;
+
     @Column(name = "starts_on", nullable = false)
     private LocalDate startsOn;
 
@@ -52,20 +59,26 @@ public class Notice {
     private boolean pinned = true;
 
     @Builder
-    public Notice(UUID targetOrganizationId, String title, String body,
+    public Notice(UUID targetOrganizationId, String title, String body, String category,
                   LocalDate startsOn, LocalDate endsOn) {
         this.targetOrganizationId = targetOrganizationId;
         this.title = title;
         this.body = body;
+        this.category = category;
         this.startsOn = startsOn;
         this.endsOn = endsOn;
     }
 
-    /** 운영자 공지 수정 — 등록 창과 같은 항목을 통째로 덮어쓴다 */
-    public void update(UUID targetOrganizationId, String title, String body, LocalDate startsOn, LocalDate endsOn) {
+    /**
+     * 운영자 공지 수정 — 등록 창과 같은 항목을 통째로 덮어쓴다.
+     * 분류만은 null이면 그대로 둔다 — 분류 칸이 없는 콘솔이 고쳐도 분류가 지워지지 않게
+     */
+    public void update(UUID targetOrganizationId, String title, String body, String category,
+                       LocalDate startsOn, LocalDate endsOn) {
         this.targetOrganizationId = targetOrganizationId;
         this.title = title;
         this.body = body;
+        if (category != null) this.category = category;
         this.startsOn = startsOn;
         this.endsOn = endsOn;
     }

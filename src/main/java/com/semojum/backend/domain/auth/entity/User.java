@@ -65,6 +65,14 @@ public class User {
     private String alias;
 
     // 마지막 로그인 시각 (운영자 기관·계정 표 · 기관 관리자 소속 계정 표) — 로그인 성공 시 갱신
+    // 기관 관리자가 적는 연락 메일(계정 상세) — 로그인에는 쓰지 않는다
+    @Column(length = 100)
+    private String email;
+
+    // 한 달(KST 달력 월) 크레딧 한도 — null = 제한 없음(기관 할당 공유), 0 = 크레딧 없음(읽기만)
+    @Column(name = "credit_limit")
+    private Long creditLimit;
+
     @Column(name = "last_login_at")
     private Instant lastLoginAt;
 
@@ -161,5 +169,12 @@ public class User {
 
     public boolean isActive() {
         return this.status == UserStatus.ACTIVE;
+    }
+
+    /** 기관 관리자 계정 상세 「저장」 — 별칭 · 메일 · 크레딧 한도를 통째로 덮어쓴다 */
+    public void changeOrgProfile(String alias, String email, Long creditLimit) {
+        this.alias = alias;
+        this.email = email;
+        this.creditLimit = creditLimit;
     }
 }

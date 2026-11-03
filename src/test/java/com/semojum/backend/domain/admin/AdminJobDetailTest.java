@@ -14,7 +14,6 @@ import com.semojum.backend.domain.result.entity.PageResult;
 import com.semojum.backend.domain.result.entity.QualityCriticalError;
 import com.semojum.backend.domain.result.repository.PageResultRepository;
 import com.semojum.backend.domain.result.repository.QualityCriticalErrorRepository;
-import com.semojum.backend.global.client.GeoIpResolver;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
 
@@ -37,9 +36,8 @@ class AdminJobDetailTest {
     private final PageResultRepository resultRepository = mock(PageResultRepository.class);
     private final QualityCriticalErrorRepository errorRepository = mock(QualityCriticalErrorRepository.class);
     private final CreditTransactionRepository creditRepository = mock(CreditTransactionRepository.class);
-    private final GeoIpResolver geoIpResolver = mock(GeoIpResolver.class);
     private final AdminMonitorService service = new AdminMonitorService(jobRepository, pageRepository,
-            resultRepository, errorRepository, creditRepository, mock(JobProgressReader.class), geoIpResolver);
+            resultRepository, errorRepository, creditRepository, mock(JobProgressReader.class));
 
     private PageResult result(Job job, int pageNo, String layout, String costKrw, LocalDateTime createdAt) {
         PageResult r = PageResult.builder().job(job).pageNumber(pageNo).status("COMPLETED")
@@ -60,7 +58,7 @@ class AdminJobDetailTest {
         User user = User.builder().loginId("user01").password("x").build();
         Job job = Job.builder().id("job-1").user(user).mode("c").totalPages(3).originalFileName("a.pdf").build();
         when(jobRepository.findById("job-1")).thenReturn(Optional.of(job));
-        when(geoIpResolver.resolve(any())).thenReturn("서울");
+        job.recordClientInfo("198.51.100.22", "macOS", "Chrome", "ua");
         // 2쪽은 재시도로 결과가 두 벌 — 나중 것만 써야 한다
         LocalDateTime t0 = LocalDateTime.of(2026, 10, 1, 9, 0);
         PageResult p1 = result(job, 1, "PAGE_LAYOUT_TEXT", "10", t0);
@@ -78,6 +76,8 @@ class AdminJobDetailTest {
         AdminMonitorDto.JobDetail d = service.getJobDetail("job-1");
 
         assertEquals("user01", d.request().loginId());
+        assertEquals("198.51.100.22", d.request().clientIp());
+        assertNull(d.request().clientLocation());   // 공인 IP여도 위치를 조회하지 않는다
         assertEquals(List.of(1, 2, 3), d.pages().stream().map(AdminMonitorDto.PageRow::pageNo).toList());
         AdminMonitorDto.PageRow row2 = d.pages().get(1);
         assertEquals("PAGE_LAYOUT_TEXT", row2.layoutType());

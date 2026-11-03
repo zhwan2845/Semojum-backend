@@ -1,5 +1,6 @@
 package com.semojum.backend.domain.org;
 
+import com.semojum.backend.domain.org.dto.OrgDto;
 import com.semojum.backend.domain.auth.entity.User;
 import com.semojum.backend.domain.auth.enums.Role;
 import com.semojum.backend.domain.auth.enums.UserStatus;
@@ -56,6 +57,8 @@ class OrgAdminServiceTest {
         return u;
     }
 
+    com.semojum.backend.domain.billing.service.CreditBalanceService balanceService;
+
     @BeforeEach
     void setUp() throws Exception {
         userRepository = Mockito.mock(UserRepository.class);
@@ -64,7 +67,8 @@ class OrgAdminServiceTest {
         jobCancelService = Mockito.mock(JobCancelService.class);
         service = new OrgAdminService(userRepository, userSessionRepository,
                 Mockito.mock(CreditTransactionRepository.class), jobRepository,
-                jobCancelService, Mockito.mock(JobProgressReader.class));
+                jobCancelService, Mockito.mock(JobProgressReader.class),
+                balanceService = Mockito.mock(com.semojum.backend.domain.billing.service.CreditBalanceService.class));
 
         orgA = Organization.builder().name("한국점자도서관").code("kblib").build();
         setId(orgA, "id", UUID.randomUUID());
@@ -134,5 +138,40 @@ class OrgAdminServiceTest {
         assertNull(member.getAlias());
         service.updateAlias(admin.getId().toString(), "kblib02", " 수학 담당 ");
         assertEquals("수학 담당", member.getAlias());
+    }
+
+    /** 크레딧 추가 요청 창 — 3,000크레딧이면 피그마 예시 ₩780,000(임시 단가 260원, 부가세 포함) */
+    @Test
+    void 예상_금액은_양_곱하기_단가다() {
+        org.springframework.test.util.ReflectionTestUtils.setField(service, "creditPriceKrw", 260L);
+        OrgDto.CreditEstimate e = service.getCreditEstimate(admin.getId().toString(), 3000);
+        assertEquals(780_000L, e.amountKrw());
+        assertEquals(260L, e.unitPriceKrw());
+
+        CustomException bad = assertThrows(CustomException.class, () -> service.getCreditEstimate(admin.getId().toString(), 0));
+        assertEquals(ErrorCode.COMMON_BAD_REQUEST, bad.getErrorCode());
+        CustomException member403 = assertThrows(CustomException.class, () -> service.getCreditEstimate(member.getId().toString(), 10));
+        assertEquals(ErrorCode.COMMON_FORBIDDEN, member403.getErrorCode());
+    }
+
+    /** 계정 상세 「저장」 — 별칭 · 메일 · 한도를 덮어쓰고, 관문이 기억한 계정 잔여를 버린다 */
+    @Test
+    void 계정_상세를_저장하면_한도가_바로_걸린다() {
+        service.updateAccount(admin.getId().toString(), "kblib02",
+                new OrgDto.UpdateAccount(" 수학 담당 ", "math@kblib.or.kr", 2000L));
+        assertEquals("수학 담당", member.getAlias());
+        assertEquals("math@kblib.or.kr", member.getEmail());
+        assertEquals(2000L, member.getCreditLimit());
+        verify(balanceService).evictAccount(member.getId());
+
+        service.updateAccount(admin.getId().toString(), "kblib02", new OrgDto.UpdateAccount(null, null, null));
+        assertNull(member.getCreditLimit(), "null = 제한 없음");
+    }
+
+    @Test
+    void 다른_기관_계정은_저장할_수_없다() {
+        CustomException e = assertThrows(CustomException.class, () -> service.updateAccount(admin.getId().toString(),
+                "snsb01", new OrgDto.UpdateAccount(null, null, 0L)));
+        assertEquals(ErrorCode.COMMON_FORBIDDEN, e.getErrorCode());
     }
 }

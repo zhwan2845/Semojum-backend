@@ -30,7 +30,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
-import com.semojum.backend.global.client.GeoIpResolver;
 import java.util.Comparator;
 
 /**
@@ -51,7 +50,6 @@ public class AdminMonitorService {
     private final QualityCriticalErrorRepository qualityCriticalErrorRepository;
     private final CreditTransactionRepository creditTransactionRepository;
     private final JobProgressReader jobProgressReader;
-    private final GeoIpResolver geoIpResolver;
 
     /** 목록 — 최근 hours(기본 24)시간의 전 기관 작업, 10초 폴링용. 지운 작업도 보인다(운영 시야) */
     @Transactional(readOnly = true)
@@ -154,7 +152,7 @@ public class AdminMonitorService {
                 user.getLoginId(), user.getAlias(),
                 user.getOrganization() != null ? user.getOrganization().getName() : null,
                 job.getStartedAt(), job.getClientIp(),
-                geoIpResolver.resolve(job.getClientIp()),   // 표시 시점 조회 — 과거 작업도 최신 DB 기준
+                null,   // 위치는 조회하지 않는다 — 콘솔 응답 모양을 지키려고 칸만 남긴다
                 job.getClientOs(), job.getClientBrowser(), job.getClientUserAgent());
     }
 

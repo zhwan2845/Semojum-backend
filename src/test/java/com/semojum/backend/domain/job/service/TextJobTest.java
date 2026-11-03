@@ -11,7 +11,6 @@ import com.semojum.backend.domain.user.repository.BrailleFormRepository;
 import com.semojum.backend.domain.user.service.BuiltinBrailleForms;
 import com.semojum.backend.global.hwp.HwpToPdfConverter;
 import com.semojum.backend.global.s3.S3Service;
-import com.semojum.backend.global.thumbnail.ThumbnailService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -61,7 +60,7 @@ class TextJobTest {
         BuiltinBrailleForms builtin = new BuiltinBrailleForms();
         builtin.load();
         service = new JobService(jobRepository, pageRepository, userRepository, s3Service,
-                redisTemplate, dispatcher, Mockito.mock(ThumbnailService.class),
+                redisTemplate, dispatcher,
                 Mockito.mock(HwpToPdfConverter.class),
                 new UploadOptionsResolver(Mockito.mock(BrailleFormRepository.class), builtin));
     }
@@ -103,7 +102,7 @@ class TextJobTest {
     void TXT_업로드도_AI를_거치지_않는다() throws Exception {
         var file = new MockMultipartFile("file", "교재.txt", "text/plain", "본문\n둘째 줄".getBytes());
 
-        var created = service.createJob(userId, List.of(file), null, false, null,
+        var created = service.createJob(userId, List.of(file), false, null,
                 null, null, null, null);
 
         assertEquals("COMPLETED", created.status());

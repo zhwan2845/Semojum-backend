@@ -24,6 +24,7 @@ import org.springframework.stereotype.Service;
 @RequiredArgsConstructor
 public class JobStatusService {
 
+    private final ConversionEtaEstimator conversionEtaEstimator;
     private final JobRepository jobRepository;
     private final PageRepository pageRepository;
     private final RedisTemplate<String, String> redisTemplate;
@@ -85,8 +86,11 @@ public class JobStatusService {
                 : overallStatus(totalPages, completedPages, succeededPages, runningPages);
 
         boolean creditExhausted = pageRepository.existsByJob_IdAndBlockedReason(jobId, Page.BLOCKED_CREDIT_EXHAUSTED);
+        // 끝난 작업 · DB로 답하는 작업은 잔여 시간이 없다
+        Integer remainingSec = fromDb || completedPages == totalPages ? null
+                : conversionEtaEstimator.remainingSeconds(jobId, totalPages - completedPages);
         return new JobResponseDto.Status(jobId, totalPages, completedPages, pendingPages, runningPages, overallStatus, pages,
-                creditExhausted);
+                creditExhausted, remainingSec);
     }
 
     /** 상태 Hash 와 같은 모양으로 DB 의 쪽 상태를 읽는다. DB 에는 RUNNING 이 없다(Redis 전용) */

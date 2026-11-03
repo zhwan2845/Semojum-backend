@@ -21,15 +21,19 @@ public class BoardController {
 
     private final BoardService boardService;
 
-    /** 목록 · 검색 — 공지 고정 + 10건씩. field: TITLE · CONTENT · TITLE_CONTENT(기본) · AUTHOR */
+    /**
+     * 목록 · 검색 — 공지 고정 + 10건씩. field: TITLE · CONTENT · TITLE_CONTENT(기본) · AUTHOR.
+     * {@code mine} = 「내 글」, {@code answered} = 「답변 받은 글」(답변이 달린 글만 — 남의 공개 글도 포함)
+     */
     @GetMapping("/posts")
     public ApiResponse<BoardDto.PostList> list(
             @AuthenticationPrincipal UserDetails userDetails,
             @RequestParam(required = false) Integer page,
             @RequestParam(required = false) String field,
             @RequestParam(required = false) String keyword,
-            @RequestParam(required = false, defaultValue = "false") boolean mine) {
-        return ApiResponse.success(boardService.list(userDetails.getUsername(), page, field, keyword, mine));
+            @RequestParam(required = false, defaultValue = "false") boolean mine,
+            @RequestParam(required = false, defaultValue = "false") boolean answered) {
+        return ApiResponse.success(boardService.list(userDetails.getUsername(), page, field, keyword, mine, answered));
     }
 
     @GetMapping("/posts/{postId}")
@@ -44,9 +48,10 @@ public class BoardController {
             @AuthenticationPrincipal UserDetails userDetails,
             @RequestParam String title,
             @RequestParam String content,
+            @RequestParam(required = false) String category,
             @RequestParam(required = false) Boolean secret,
             @RequestPart(value = "files", required = false) List<MultipartFile> files) {
-        return ApiResponse.success(boardService.create(userDetails.getUsername(), title, content, secret, files));
+        return ApiResponse.success(boardService.create(userDetails.getUsername(), title, content, category, secret, files));
     }
 
     /** 글 수정 — 본인만. keepAttachmentIds에 든 첨부만 남기고 files를 더한다 */
@@ -56,11 +61,20 @@ public class BoardController {
             @PathVariable Long postId,
             @RequestParam String title,
             @RequestParam String content,
+            @RequestParam(required = false) String category,
             @RequestParam(required = false) Boolean secret,
             @RequestParam(required = false) List<Long> keepAttachmentIds,
             @RequestPart(value = "files", required = false) List<MultipartFile> files) {
-        return ApiResponse.success(boardService.update(userDetails.getUsername(), postId, title, content, secret,
+        return ApiResponse.success(boardService.update(userDetails.getUsername(), postId, title, content, category, secret,
                 keepAttachmentIds, files));
+    }
+
+    /** 이어 묻기 — 글쓴이만. 마이페이지 문의 내역 「회신...」 · 보내기 */
+    @PostMapping("/posts/{postId}/follow-ups")
+    public ApiResponse<BoardDto.Answer> createFollowUp(@AuthenticationPrincipal UserDetails userDetails,
+                                                       @PathVariable Long postId,
+                                                       @RequestBody BoardDto.CreateFollowUp request) {
+        return ApiResponse.success(boardService.createFollowUp(userDetails.getUsername(), postId, request));
     }
 
     @DeleteMapping("/posts/{postId}")

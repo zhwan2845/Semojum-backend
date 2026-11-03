@@ -81,4 +81,15 @@ public interface CreditTransactionRepository extends JpaRepository<CreditTransac
     @Query("SELECT t.jobId, COALESCE(SUM(t.amount), 0) FROM CreditTransaction t " +
             "WHERE t.jobId IN :jobIds GROUP BY t.jobId")
     List<Object[]> sumPerJob(@Param("jobIds") List<String> jobIds);
+
+    // 계정의 기간 차감을 작업별로 — 과금 이력 상세의 「사용」 행. [jobId, 마지막 차감 시각, 차감 쪽 수, sum]
+    @Query("SELECT t.jobId, MAX(t.createdAt), COUNT(t), COALESCE(SUM(t.amount), 0) FROM CreditTransaction t " +
+            "WHERE t.userId = :userId AND t.createdAt >= :from AND t.createdAt < :to GROUP BY t.jobId")
+    List<Object[]> sumPerJobByUserBetween(@Param("userId") UUID userId,
+                                          @Param("from") Instant from, @Param("to") Instant to);
+
+    // 기관 계약분 차감의 시각 · 양 — 과금 이력 행별 잔여를 거꾸로 셀 때. [created_at, amount], 시각 오름차순
+    @Query("SELECT t.createdAt, t.amount FROM CreditTransaction t " +
+            "WHERE t.organizationId = :orgId AND t.source = 'CONTRACT' AND t.createdAt >= :from ORDER BY t.createdAt")
+    List<Object[]> findContractUsageSince(@Param("orgId") UUID orgId, @Param("from") Instant from);
 }

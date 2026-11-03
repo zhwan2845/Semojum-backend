@@ -114,4 +114,11 @@ public interface JobRepository extends JpaRepository<Job, String> {
     /** 작업 주인의 기관 — 무소속이거나 없는 작업이면 null (크레딧 관문용) */
     @Query("SELECT o.id FROM Job j JOIN j.user u LEFT JOIN u.organization o WHERE j.id = :jobId")
     UUID findOrganizationIdById(@Param("jobId") String jobId);
+
+    /** 작업 주인과 그 기관 — [userId, orgId(무소속이면 null)]. 없는 작업이면 빈 목록 (크레딧 관문용) */
+    @Query("SELECT u.id, o.id FROM Job j JOIN j.user u LEFT JOIN u.organization o WHERE j.id = :jobId")
+    List<Object[]> findOwnerById(@Param("jobId") String jobId);
+
+    /** 지금 변환 중인 작업 수 — 잔여 시간에서 AI 슬롯을 몇 작업이 나눠 쓰는지 */
+    long countByStatus(String status);
 }

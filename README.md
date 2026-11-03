@@ -48,9 +48,9 @@ AI 결과는 쪽 전체가 한 덩어리 글로 오지 않고 **제목 · 본문
 | Storage | AWS S3 (EC2 IAM Role 키리스 인증, presigned URL) |
 | 통신 | gRPC + TLS (GPU 추론서버), SSE (실시간 진행 상황) |
 | 인증 | JWT (jjwt) Access/Refresh, BCrypt, 세션 테이블 |
-| 문서 처리 | OpenPDF, PDFBox, poppler(`pdftoppm`), hwplib, pyhwp + LibreOffice |
+| 문서 처리 | OpenPDF, PDFBox, poppler(`pdftoppm`), rhwp, hwplib, pyhwp + LibreOffice |
 | Infra · CI/CD | AWS EC2 · RDS · S3 · ECR, Docker Compose, Envoy, GitHub Actions (OIDC) |
-| Test | JUnit 5, Testcontainers (PostgreSQL · Redis), 테스트 클래스 80개 |
+| Test | JUnit 5, Testcontainers (PostgreSQL · Redis), 테스트 클래스 86개 |
 
 <br>
 
@@ -76,13 +76,13 @@ AI 결과는 쪽 전체가 한 덩어리 글로 오지 않고 **제목 · 본문
 **변환 파이프라인**
 
 ```
-업로드 ──▶ 파일 종류 판별(내용물 시그니처) ──▶ HWP/HWPX → PDF 변환 ──▶ 쪽 분리 · 썸네일
+업로드 ──▶ 파일 종류 판별(내용물 시그니처) ──▶ HWP/HWPX → PDF 변환 ──▶ 쪽 분리
    │
    └─▶ (트랜잭션 커밋 후) Redis 작업별 큐에 쪽 태스크 적재
                 │
      JobDispatcher: 유저 링 → 작업 링 → 쪽 1장 (2계층 라운드로빈, FG:BG = 4:1)
                 │
-     CreditGate: 기관 잔여 크레딧 확인 (부족하면 한 쪽씩 / 소진되면 차단)
+     CreditGate: 기관 · 계정 잔여 크레딧 확인 (부족하면 한 쪽씩 / 소진되면 차단)
                 │
      PageWorker × N (AI 슬롯 수만큼) ──gRPC──▶ GPU 추론서버
                 │
@@ -111,6 +111,7 @@ AI 결과는 쪽 전체가 한 덩어리 글로 오지 않고 **제목 · 본문
 - 마지막 쪽들이 모두 GPU 추론서버에 들어가 있으면 최대 수백 초 동안 보낼 것이 없어 끊긴 연결을 알 수 없었습니다. **30초 하트비트(`: ping`)** 로 죽은 연결을 드러냅니다.
 - 진행 상태 Hash는 종료 1시간 뒤 사라집니다. 그 뒤에 붙은 연결이 "아직 시작 전"과 구분되지 않아 몇 시간씩 매달리던 문제가 있어, **Hash가 비면 DB로 상태를 확인해 즉시 종료**하게 고쳤습니다.
 - `spring.jpa.open-in-view=false`로 두어 긴 SSE 연결이 DB 커넥션을 붙잡지 않게 했습니다.
+- **남은 시간을 실제 처리 속도로 계산합니다**([`ConversionEtaEstimator`](src/main/java/com/semojum/backend/domain/job/service/ConversionEtaEstimator.java)). 쪽이 3개 이상 끝나면 그 작업의 최근 처리 간격으로, 그 전에는 최근 200쪽의 평균 처리 시간 × 남은 쪽 ÷ 쓸 수 있는 슬롯으로 잽니다. 중앙값을 쓰면 오래 걸리는 쪽(평균 30초, 중앙값 6초)을 빼먹어 평균을 쓰고, 직전 값과 섞어(지수 평활) 숫자가 튀지 않게 했습니다.
 
 ### 4-3. 크레딧 · 원가 계산 — 숫자가 틀리지 않게
 
@@ -121,14 +122,18 @@ AI 결과는 쪽 전체가 한 덩어리 글로 오지 않고 **제목 · 본문
 - 단가표에 없는 모델은 0원으로 처리하지 않고 `cost_uncertain=true`로 표시합니다.
 - 크레딧은 **성공한 쪽만** 레이아웃별 배율(텍스트 1 · 수식 2 · 표 3 · 그림 5)로 차감합니다. `(job_id, page_no)` 유니크 제약으로 **워커가 재시도해도 이중 차감이 불가능**합니다. 0 차감도 고객 검산용으로 기록합니다.
 - **잔여 크레딧 관문**: 크레딧은 결과를 받은 뒤 빠지므로, 동시에 보낸 쪽들은 모두 같은 잔액을 보고 통과합니다. 잔여가 10 미만이면 **기관 전체에서 한 번에 한 쪽만** 보내 초과 사용을 줄이고, 0 이하면 AI에 보내지 않고 `CREDIT_EXHAUSTED`로 막습니다. 충전 후 [`JobResumeService`](src/main/java/com/semojum/backend/domain/job/service/JobResumeService.java)로 막힌 쪽만 이어서 처리합니다.
+- **계정별 한 달 한도**: 기관 관리자가 계정마다 한 달 크레딧 한도를 둘 수 있습니다. 계정 잔여와 기관 잔여를 함께 보고 먼저 바닥나는 쪽에서 멈춥니다.
 
-### 4-4. 문서 처리 — 메모리 768MB 안에서 100MB 파일 여러 개
+### 4-4. 문서 처리 — 100MB 파일이 몰려도 서버가 죽지 않게
 
-> [`JobService`](src/main/java/com/semojum/backend/domain/job/service/JobService.java) · [`HwpToPdfConverter`](src/main/java/com/semojum/backend/global/hwp/HwpToPdfConverter.java) · [`HwpxToHtml`](src/main/java/com/semojum/backend/global/hwp/HwpxToHtml.java) · [`PdfPageRenderer`](src/main/java/com/semojum/backend/global/pdf/PdfPageRenderer.java)
+> [`JobService`](src/main/java/com/semojum/backend/domain/job/service/JobService.java) · [`HwpToPdfConverter`](src/main/java/com/semojum/backend/global/hwp/HwpToPdfConverter.java) · [`HwpxToHtml`](src/main/java/com/semojum/backend/global/hwp/HwpxToHtml.java) · [`ConversionMemoryGate`](src/main/java/com/semojum/backend/global/hwp/ConversionMemoryGate.java) · [`HwpFileHeaderReader`](src/main/java/com/semojum/backend/global/hwp/HwpFileHeaderReader.java) · [`PdfPageRenderer`](src/main/java/com/semojum/backend/global/pdf/PdfPageRenderer.java)
 
-- 업로드 원본을 `byte[]`로 힙에 올리면 **100MB 파일 4건 동시 업로드에서 OOM**이 났습니다(실측). 원본을 임시 파일로 옮겨 **경로 기반으로 쪽을 나누고 썸네일을 만들도록** 바꿨고, 임시 파일은 `finally`에서 정리합니다.
-- **HWP**: pyhwp → ODT → LibreOffice로 PDF를 만듭니다. 변환기가 머리말 · 꼬리말을 잃어버려서 hwplib로 직접 읽어 다시 넣습니다.
-- **HWPX**는 LibreOffice가 열지 못해 본문 XML을 HTML로 풀어 PDF로 만듭니다. 확장자가 아닌 **파일 내용(ZIP 시그니처)** 으로 형식을 구분합니다.
+- PDF · HWP 업로드 원본을 `byte[]`로 힙에 올리면 **100MB 파일 4건 동시 업로드에서 OOM**이 났습니다(실측). 원본을 임시 파일로 옮겨 **경로 기반으로 쪽을 나누도록** 바꿨고, 임시 파일은 `finally`에서 정리합니다. 이미지는 여러 장의 합계를 100MB로 제한합니다.
+- **HWP**: 먼저 rhwp로 한글 조판대로 쪽을 나눠, 쪽 수 · 2단 · 머리말이 원본대로 나오게 했습니다. 실패하거나 120초를 넘기거나 한 쪽이라도 20MB(GPU 추론서버의 gRPC 수신 한도)를 넘으면 기존 경로(pyhwp → ODT → LibreOffice)로 넘깁니다. 기존 경로는 머리말 · 꼬리말을 잃어버려서 hwplib로 직접 읽어 다시 넣습니다.
+- **동시 변환 메모리 관문**: 변환 도구는 JVM 밖 프로세스라 힙 상한이 걸리지 않고, 몰리면 OS의 OOM killer가 백엔드 JVM을 죽입니다. 변환 개수가 아니라 **단계마다 예상 메모리**(운영 서버에서 잰 기본값 + 파일 MB당 값)만큼 전체 예산(1600MB)에서 빌려 쓰고, 모자라면 기다리게 했습니다.
+- 큰 HWP를 hwplib로 통째로 읽으면 그림까지 힙에 올라가(28MB 파일 → 73MB) 관문에 들어가기 전에 동시 업로드가 힙 OOM을 냈습니다. **파일 머리말만 읽어** 깨진 · 암호 · 배포용 파일을 먼저 거르도록 바꿔 0.7MB로 줄였습니다.
+- **HWPX**는 LibreOffice가 열지 못해 기존 경로에서는 본문 XML을 HTML로 풀어 PDF로 만듭니다. 확장자가 아닌 **파일 내용(ZIP 시그니처)** 으로 형식을 구분합니다.
+- **암호 PDF**: 열람 암호가 필요하면 앱이 사용자에게 암호를 받아 같은 요청을 다시 보냅니다. 암호는 저장하거나 로그에 남기지 않고, 나눈 쪽 PDF에는 암호를 걸지 않습니다.
 - **스캔 PDF 미리보기**: PDFBox는 JPEG 2000 스캔본을 백지로 그리고, 순수 Java 디코더는 OOM이 났습니다. poppler `pdftoppm`을 **별도 프로세스**로 실행해 JVM과 격리하고, 실패하면 PDFBox로 폴백합니다.
 - 서버가 미리 렌더한 JPEG를 내려주어 앱의 원본 패널 표시 시간이 **1.8~2.9초(pdf.js) → 6~9ms(`<img>`)** 로 줄었습니다.
 
@@ -146,7 +151,7 @@ AI 결과는 쪽 전체가 한 덩어리 글로 오지 않고 **제목 · 본문
 
 > [`LoginAttemptService`](src/main/java/com/semojum/backend/domain/auth/service/LoginAttemptService.java) · [`global/jwt`](src/main/java/com/semojum/backend/global/jwt) · [`global/config`](src/main/java/com/semojum/backend/global/config)
 
-- JWT Access(1시간) / Refresh(12시간)와 세션 테이블을 함께 씁니다. 로그인하면 기존 세션을 모두 끊어 **중복 로그인을 막습니다**.
+- JWT Access(1시간) / Refresh(12시간, 「로그인 상태 유지」를 켜면 30일)와 세션 테이블을 함께 씁니다. 토큰만 길면 세션 만료로 재발급이 거절되므로 두 수명을 같게 맞춥니다. 로그인하면 기존 세션을 모두 끊어 **중복 로그인을 막습니다**.
 - **로그인 5회 실패 시 10분 잠금**(Redis TTL).
 - 운영자 계정을 웹 콘솔용과 앱용으로 나누고, 로그인 요청의 Origin으로 콘솔 로그인인지 판별합니다.
 - 기관 계정을 잠그면 즉시 세션을 끊고 **진행 중인 변환도 취소**합니다. 쪽 단위로 차감하므로 완료된 쪽까지만 차감됩니다.
@@ -168,8 +173,9 @@ AI 결과는 쪽 전체가 한 덩어리 글로 오지 않고 **제목 · 본문
 - `dev` 브랜치 push → GitHub Actions 테스트 게이트 → 비공개 ECR(커밋 해시 태그, 덮어쓰기 금지) → EC2 배포.
 - **블루그린**: 쉬고 있는 색으로 새 버전을 띄우고 `/api/health`가 통과해야만(120초) Envoy가 넘겨받습니다. 실패하면 구버전이 계속 서비스합니다. 서버 파일 잠금(`flock`)으로 수동 배포와 CI 배포가 겹치지 않게 했습니다.
 - **키 없는 인증**: CI는 GitHub OIDC로 dev 브랜치에서만 배포 역할을 맡고, EC2는 IAM Role로 S3 · ECR에 접근합니다. 저장된 AWS 키가 없습니다.
-- SSH 22번은 상시 개방하지 않고 배포 동안만 러너 IP를 열었다가 `if: always()`로 회수합니다. RDS는 private subnet에 두어 VPC 안에서만 닿고, Redis는 서버 밖으로 포트를 열지 않습니다. EC2 메타데이터는 IMDSv2만 허용합니다.
+- **SSH 22번 인바운드 규칙이 없습니다.** CI와 관리자 모두 AWS SSM Session Manager를 거쳐 붙고(IAM 권한 + SSH 키 두 겹), 배포 때문에 포트를 여는 일도 없습니다. RDS는 private subnet에 두어 VPC 안에서만 닿고, Redis는 서버 밖으로 포트를 열지 않습니다. EC2 메타데이터는 IMDSv2만 허용합니다.
 - Envoy는 연결 실패에만 재시도해 **POST 중복 처리를 막고**, SSE 라우트는 타임아웃을 끕니다. 배포로 컨테이너가 바뀌면 로그도 사라지므로 배포 직전에 로그를 보관합니다.
+- 컨테이너 메모리 상한을 **힙(상한의 40%) + JVM 기타 + 문서 변환 예산**으로 나눠 잡아, 블루그린 전환 중 두 색이 함께 떠도 서버 메모리를 넘지 않게 했습니다.
 
 ### 4-9. 운영 관측
 
@@ -197,7 +203,7 @@ com.semojum.backend
 │   ├── support   공지 · 문의(IMAP 폴링) · 주문
 │   ├── app       앱 버전 공지
 │   └── rule      점자 규정 검색 (인메모리)
-├── global        config · jwt · exception · grpc · s3 · hwp · pdf · thumbnail · logging · health
+├── global        config · jwt · exception · grpc · s3 · hwp · pdf · logging · health
 └── grpc          proto 생성 클래스
 ```
 

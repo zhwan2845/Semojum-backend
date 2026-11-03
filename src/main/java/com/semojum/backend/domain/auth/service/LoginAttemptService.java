@@ -39,11 +39,16 @@ public class LoginAttemptService {
 
     private final RedisTemplate<String, String> redisTemplate;
 
-    /** AUTH4001의 result — 화면 「남은 횟수 2회입니다」 */
-    public record Failure(int remainingAttempts) {}
+    /**
+     * AUTH4001의 result — 화면 「남은 횟수 2회입니다」.
+     *
+     * <p>{@code maxAttempts} · {@code lockMinutes}는 정책값이다 — 앱이 「5회 실패하면 10분 동안 잠깁니다」를
+     * 상수로 들고 있지 않게 해서, 정책을 바꿔도 앱 문구가 따라가게 한다.
+     */
+    public record Failure(int remainingAttempts, int maxAttempts, long lockMinutes) {}
 
-    /** AUTH4006의 result — 잠금이 풀리는 시각(KST) */
-    public record Locked(LocalDateTime unlockAt) {}
+    /** AUTH4006의 result — 잠금이 풀리는 시각(KST)과 정책값 */
+    public record Locked(LocalDateTime unlockAt, int maxAttempts, long lockMinutes) {}
 
     static String failKey(String loginId) {
         return "auth:login-fail:" + loginId;
@@ -75,7 +80,7 @@ public class LoginAttemptService {
             return locked(unlockAt);
         }
         redisTemplate.expire(failKey(loginId), LOCK_DURATION);
-        return new CustomException(ErrorCode.AUTH_INVALID_CREDENTIALS, new Failure(MAX_FAILURES - count));
+        return new CustomException(ErrorCode.AUTH_INVALID_CREDENTIALS, new Failure(MAX_FAILURES - count, MAX_FAILURES, LOCK_DURATION.toMinutes()));
     }
 
     /** 로그인 성공 — 센 것을 지운다 */
@@ -84,6 +89,7 @@ public class LoginAttemptService {
     }
 
     private static CustomException locked(Instant unlockAt) {
-        return new CustomException(ErrorCode.AUTH_LOGIN_LOCKED, new Locked(LocalDateTime.ofInstant(unlockAt, KST)));
+        return new CustomException(ErrorCode.AUTH_LOGIN_LOCKED, new Locked(LocalDateTime.ofInstant(unlockAt, KST),
+                MAX_FAILURES, LOCK_DURATION.toMinutes()));
     }
 }

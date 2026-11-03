@@ -38,10 +38,15 @@ public class JwtProvider {
     }
 
     public String generateRefreshToken(String userId) {
+        return generateRefreshToken(userId, refreshTokenExpiry);
+    }
+
+    /** 수명을 정해 리프레시 토큰을 만든다 — 「로그인 상태 유지」는 기본보다 길다 */
+    public String generateRefreshToken(String userId, long expiryMillis) {
         return Jwts.builder()
                 .subject(userId)
                 .issuedAt(new Date())
-                .expiration(new Date(System.currentTimeMillis() + refreshTokenExpiry))
+                .expiration(new Date(System.currentTimeMillis() + expiryMillis))
                 .signWith(key)
                 .compact();
     }

@@ -24,6 +24,7 @@ message BrailleRequest {
   int32  korean_grade  = 10;  // 한글 점자 급수. 1 정자 · 2 약자. 0 = 서버 기본(2)
   int32  english_grade = 11;  // 영어 점자 급수. 1 정자 · 2 약자. 0 = 서버 기본(2)
   bool   split_choices = 12;  // 선택지를 한 줄이 하나씩 적는다. 안 보내면 짧은 선택지를 합친다. (기본 false)
+  repeated VisualOption visual_options = 13;  // [추가] 시각 자료 갈래별 설명 유형 설정. 비면 서버가 전부 낸다
 }
 
 // ── 서브메시지 ───────────────────────────────────────────────────
@@ -46,13 +47,14 @@ message RuleTrail {
   string rule_name   = 4;   // 조항 이름
   string contents    = 5;   // 조항 본문에서 뽑은 대목
   string priority    = 6;   // 적용 우선순위
-  int32  line_no     = 7;   // 원문 행 번호
-  int32  col_start   = 8;   // 적용된 글의 시작 자리
-  int32  col_end     = 9;   // 적용된 글의 끝 자리
+  int32  line_no     = 7;   // [변경] 늘 0. contents 는 줄바꿈까지 담은 통 문자열 하나다
+  int32  col_start   = 8;   // [변경] 그 요소 contents[0] 안의 시작 오프셋
+  int32  col_end     = 9;   // [변경] 그 요소 contents[0] 안의 끝 오프셋. 끝은 포함하지 않는다
   string tag         = 10;  // 분류 꼬리표
   string publisher   = 11;  // 문화체육관광부 · 국립장애인도서관 · 국립특수교육원
   int32  version     = 12;  // 발행 연도. 2024 · 2025
   SectionPath path   = 13;  // 조문 경로
+  string axis        = 14;  // [추가] 좌표가 센 글. "print" 묵자 글자 · "braille" 점자 칸. 이 응답은 늘 "print"
 }
 
 message SectionPath {
@@ -64,10 +66,11 @@ message SectionPath {
   string item         = 6;  // 목. 없는 단계는 ""
 }
 
-message TactileGraphic {
-  string ascii_braille = 1;  // 촉각 그래픽 점자. 미사용
-  string svg_path      = 2;  // 촉각 그래픽 벡터. 미사용
-  string target_tool   = 3;  // 출력 장비 이름. 미사용
+// [추가] 시각 자료 한 갈래의 설명 유형 설정
+message VisualOption {
+  string         element_type    = 1;  // 자료 갈래. figure · table · chart · diagram · cartoon
+  repeated int32 allowed_options = 2;  // 낼 안의 Draft.option 번호. 비면 제한하지 않는다
+  int32          default_option  = 3;  // 기본으로 고를 Draft.option 번호. 0 = 서버 기본
 }
 
 message CriticalError {
@@ -93,6 +96,7 @@ message ProcessingMeta {
   float  pdf_layer_confidence = 2;   // PDF 글자층 신뢰도
   string routing_tier_used    = 3;   // ZERO | STANDARD | QUALITY | FALLBACK
   bool   scan_only            = 4;   // 글자층 없는 스캔본
+  reserved 5, 6;                     // [추가] 쓰지 않는다. 다시 쓰지 않을 번호
 }
 
 message Draft {
@@ -100,6 +104,8 @@ message Draft {
   reserved 2;         // 쓰지 않는다
   string label = 3;   // 고르기 창에 뜨는 이름. "생략" · "짧은 제목" · "개조식" · "줄글" 등
   string tn_text = 4;   // 이 초안의 점역 태그가 든 묵자.
+  reserved 5;         // [추가] 쓰지 않는다. 다시 쓰지 않을 번호
+  int32  option = 6;  // [추가] 안의 고정 번호. 1 생략 · 2 기본 설명 · 6 별책 참조 · 7 줄글 · 8 가계도 · 10 흐름도 · 11 단순 · 12 자세히
 }
 
 message TextElement {
@@ -115,7 +121,7 @@ message TextElement {
   string          visual_subtype     = 9;    // 시각 자료 세분류. 개념도 · 흐름도 …
   float           subtype_confidence = 10;   // 세분류 신뢰도
   string          latex_string       = 11;   // 수식 요소의 LaTeX 원문
-  TactileGraphic  tactile            = 12;   // 촉각 그래픽. 미사용
+  reserved 12;                               // [삭제] 쓰지 않는다. 다시 쓰지 않을 번호
   repeated string    contents        = 13;   // 본문 묵자. 통 문자열 1항목, 점역 태그 포함
   repeated RuleTrail rule_trail      = 14;   // 적용된 규정 목록
   repeated Draft     drafts          = 15;   // 시각 자료 대체 설명 초안들. 글·수식 요소는 빈 배열
@@ -123,6 +129,8 @@ message TextElement {
 
   string             table_source    = 17;   // 표 요소의 칸 글. <!표><!행><!칸> 태그 꼴. 표 요소에만 채운다
   int32              table_box_level = 18;   // 표를 감싼 글상자 단계. 0 = 상자 밖. 표 요소에만 채운다
+  reserved 19, 20, 21;                       // [추가] 쓰지 않는다. 다시 쓰지 않을 번호
+  string             review_flag     = 22;   // [추가] 줄 번호 칸에 띄우는 신호. "" 없음 · "open" 경고 · "sug" 고침 제안 · "note" 메모
 }
 
 // ── 사용량 ──────────────────────────────────────────────────────
